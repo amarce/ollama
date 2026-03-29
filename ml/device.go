@@ -478,6 +478,9 @@ func (a DeviceInfo) IsBetter(b DeviceInfo) bool {
 
 // For each GPU, check if it does NOT support flash attention
 func FlashAttentionSupported(l []DeviceInfo) bool {
+	if len(l) == 0 {
+		return false // no GPUs = no FA support
+	}
 	for _, gpu := range l {
 		supportsFA := strings.EqualFold(gpu.Library, "cpu") ||
 			strings.EqualFold(gpu.Name, "Metal") || strings.EqualFold(gpu.Library, "Metal") ||

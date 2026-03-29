@@ -63,28 +63,30 @@ static __global__ void turboquant_encode_kernel(
 
     // Randomized Hadamard Transform (RHT):
     //   1. Apply random sign-flips: x'[i] = x[i] * s[i], s[i] in {-1, +1}
-    //   2. Apply in-place Walsh-Hadamard transform (orthogonal, O(n log n))
+    //   2. Zero-pad to next power of 2 so all elements participate in WHT
+    //   3. Apply in-place Walsh-Hadamard butterfly (orthogonal, O(n log n))
+    //   4. Normalize by 1/sqrt(wht_size)
     //
-    // This is an approximate random rotation matrix with the key property
-    // that angular distribution becomes concentrated (isotropic), which is
-    // exactly what PolarQuant needs for optimal quantization.
-    //
-    // Step 1: Load + random sign flips
-    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
-        uint32_t sign_bits = tq_hash(rotation_seed ^ (uint64_t)head_idx, (uint32_t)(i / 32));
-        float sign = ((sign_bits >> (i & 31)) & 1) ? -1.0f : 1.0f;
-        rotated[i] = __half2float(src[src_offset + i]) * sign;
+    // Padding ensures non-power-of-2 head_dim (e.g. 80, 96) get a proper
+    // orthogonal rotation instead of leaving tail elements untransformed.
+
+    // Compute padded size = next power of 2 >= head_dim
+    int wht_size = 1;
+    while (wht_size < head_dim) wht_size *= 2;
+
+    // Step 1: Load + random sign flips, zero-pad tail
+    for (int i = threadIdx.x; i < wht_size; i += blockDim.x) {
+        if (i < head_dim) {
+            uint32_t sign_bits = tq_hash(rotation_seed ^ (uint64_t)head_idx, (uint32_t)(i / 32));
+            float sign = ((sign_bits >> (i & 31)) & 1) ? -1.0f : 1.0f;
+            rotated[i] = __half2float(src[src_offset + i]) * sign;
+        } else {
+            rotated[i] = 0.0f;  // zero-pad for WHT orthogonality
+        }
     }
     __syncthreads();
 
-    // Step 2: In-place Walsh-Hadamard transform over shared memory
-    // Each butterfly stage: for pairs (i, i^half), compute (a+b, a-b)
-    // Operates on power-of-2 size; if head_dim isn't power of 2, we
-    // zero-pad implicitly (head_dim is typically 64, 80, 96, 128, 256).
-    // Find the largest power of 2 <= head_dim for the WHT butterfly
-    int wht_size = 1;
-    while (wht_size * 2 <= head_dim) wht_size *= 2;
-
+    // Step 2: In-place Walsh-Hadamard butterfly over padded size
     for (int half = 1; half < wht_size; half *= 2) {
         for (int idx = threadIdx.x; idx < wht_size / 2; idx += blockDim.x) {
             int block_start = (idx / half) * (half * 2);
@@ -338,20 +340,27 @@ static __global__ void turboquant_decode_kernel(
     }
     __syncthreads();
 
-    // Inverse Randomized Hadamard Transform (self-inverse up to scaling):
-    //   1. Normalize by 1/sqrt(wht_size) (inverse WHT = WHT / n, but we
-    //      already normalized once during encode, so apply 1/sqrt again)
-    //   2. Apply Walsh-Hadamard butterfly (same as forward)
-    //   3. Apply random sign-flips (sign-flip is self-inverse)
+    // Inverse Randomized Hadamard Transform:
+    //   Must use same padded wht_size as encode (next power of 2 >= head_dim).
+    //   Zero-pad decoded[head_dim..wht_size) before inverse WHT, then only
+    //   output the first head_dim elements.
     int wht_size_d = 1;
-    while (wht_size_d * 2 <= head_dim) wht_size_d *= 2;
+    while (wht_size_d < head_dim) wht_size_d *= 2;
 
+    // Zero-pad tail for WHT (shared memory was only allocated for wht_size)
+    for (int i = threadIdx.x + head_dim; i < wht_size_d; i += blockDim.x) {
+        decoded[i] = 0.0f;
+    }
+    __syncthreads();
+
+    // Normalize by 1/sqrt(wht_size) (inverse of forward normalization)
     float inv_sqrt_d = rsqrtf((float)wht_size_d);
-    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+    for (int i = threadIdx.x; i < wht_size_d; i += blockDim.x) {
         decoded[i] *= inv_sqrt_d;
     }
     __syncthreads();
 
+    // Walsh-Hadamard butterfly (same as forward — WHT is self-inverse up to scale)
     for (int half = 1; half < wht_size_d; half *= 2) {
         for (int idx = threadIdx.x; idx < wht_size_d / 2; idx += blockDim.x) {
             int block_start = (idx / half) * (half * 2);
@@ -367,6 +376,7 @@ static __global__ void turboquant_decode_kernel(
     }
 
     // Undo random sign-flips (self-inverse: multiply by same signs)
+    // Only output the first head_dim elements (ignore padding)
     for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
         uint32_t sign_bits = tq_hash(rotation_seed ^ (uint64_t)head_idx, (uint32_t)(i / 32));
         float sign = ((sign_bits >> (i & 31)) & 1) ? -1.0f : 1.0f;
@@ -400,7 +410,10 @@ void turboquant_encode_cuda(
     else if (block_size < 128) block_size = 128;
     else block_size = 256;
 
-    size_t shared_mem = head_dim * sizeof(float) + sizeof(float);
+    // Shared memory must hold the WHT-padded array (next power of 2 >= head_dim)
+    int wht_size = 1;
+    while (wht_size < head_dim) wht_size *= 2;
+    size_t shared_mem = wht_size * sizeof(float);
 
     turboquant_encode_kernel<<<total_vecs, block_size, shared_mem, stream>>>(
         src, dst, head_dim, num_kv_heads, batch_size, num_bits, rotation_seed
@@ -426,7 +439,10 @@ void turboquant_decode_cuda(
     else if (block_size < 128) block_size = 128;
     else block_size = 256;
 
-    size_t shared_mem = head_dim * sizeof(float);
+    // Shared memory must hold the WHT-padded array (next power of 2 >= head_dim)
+    int wht_size = 1;
+    while (wht_size < head_dim) wht_size *= 2;
+    size_t shared_mem = wht_size * sizeof(float);
 
     turboquant_decode_kernel<<<total_vecs, block_size, shared_mem, stream>>>(
         src, dst, head_dim, num_kv_heads, count, num_bits, rotation_seed

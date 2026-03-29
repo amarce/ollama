@@ -16,12 +16,6 @@ import (
 	"strings"
 )
 
-// GPUInfo is the minimal GPU interface needed for auto-enable detection.
-// This avoids importing the ml package and creating a circular dependency.
-type GPUInfo interface {
-	GetLibrary() string
-}
-
 // ShouldAutoEnable returns true if TurboQuant should be auto-enabled based on
 // the environment variable value, explicit KV cache type, and available GPUs.
 // This consolidates the auto-enable decision into a single location.
@@ -73,6 +67,9 @@ const QJLProjectionDim = 32
 // CompressionRatio returns the effective compression ratio for a given bit-width
 // and head dimension. If headDim is 0, the common default of 128 is used.
 func CompressionRatio(numBits int, headDim ...int) float64 {
+	if numBits < 2 || numBits > 4 {
+		return 1.0 // invalid bit-width, no compression
+	}
 	hd := 128.0
 	if len(headDim) > 0 && headDim[0] > 0 {
 		hd = float64(headDim[0])

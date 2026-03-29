@@ -472,7 +472,12 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 			wantPath = req.model.ShortName
 		}
 		if s.activeLoading.ModelPath() != wantPath {
-			panic(fmt.Errorf("attempting to load different model after eviction (original %v new %v)", s.activeLoading.ModelPath(), wantPath))
+			slog.Error("model load state mismatch after eviction",
+				"original", s.activeLoading.ModelPath(), "new", wantPath)
+			s.loadedMu.Unlock()
+			req.errCh <- fmt.Errorf("model load state mismatch: expected %v, got %v",
+				s.activeLoading.ModelPath(), wantPath)
+			return false
 		}
 	}
 

@@ -23,6 +23,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sync/semaphore"
@@ -104,8 +105,8 @@ type llmServer struct {
 	llamaModelLock *sync.Mutex
 
 	totalLayers  uint64
-	loadStart    time.Time // Record how long it took the model to load
-	loadProgress float32
+	loadStart    time.Time  // Record how long it took the model to load
+	loadProgress *atomic.Uint32 // stores float32 bits atomically via math.Float32bits/frombits
 
 	sem *semaphore.Weighted
 }
@@ -335,6 +336,7 @@ func NewLlamaServer(systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, modelPath st
 		sem:            semaphore.NewWeighted(int64(numParallel)),
 		totalLayers:    f.KV().BlockCount() + 1,
 		loadStart:      time.Now(),
+		loadProgress:   &atomic.Uint32{},
 		done:           make(chan struct{}),
 	}
 
@@ -426,21 +428,16 @@ func StartRunner(ollamaEngine bool, modelPath string, gpuLibs []string, out io.W
 
 	cmd.Env = os.Environ()
 
+	var stdout, stderr io.ReadCloser
 	if out != nil {
-		stdout, err := cmd.StdoutPipe()
+		stdout, err = cmd.StdoutPipe()
 		if err != nil {
 			return nil, 0, fmt.Errorf("failed to spawn server stdout pipe: %w", err)
 		}
-		stderr, err := cmd.StderrPipe()
+		stderr, err = cmd.StderrPipe()
 		if err != nil {
 			return nil, 0, fmt.Errorf("failed to spawn server stderr pipe: %w", err)
 		}
-		go func() {
-			io.Copy(out, stdout) //nolint:errcheck
-		}()
-		go func() {
-			io.Copy(out, stderr) //nolint:errcheck
-		}()
 	}
 	cmd.SysProcAttr = LlamaServerSysProcAttr
 
@@ -489,6 +486,17 @@ func StartRunner(ollamaEngine bool, modelPath string, gpuLibs []string, out io.W
 	if err = cmd.Start(); err != nil {
 		return nil, 0, err
 	}
+
+	// Launch pipe copy goroutines only after successful Start to avoid leaks
+	if out != nil && stdout != nil && stderr != nil {
+		go func() {
+			io.Copy(out, stdout) //nolint:errcheck
+		}()
+		go func() {
+			io.Copy(out, stderr) //nolint:errcheck
+		}()
+	}
+
 	err = nil
 	return
 }
@@ -1197,6 +1205,9 @@ func findBestFit(layers []uint64, gpus []ml.DeviceInfo, requestedLayers int, for
 
 // greedyFit assigns layers incrementally to GPUs, spilling over as each runs out of free space
 func greedyFit(layers []uint64, gpus []ml.DeviceInfo, capacity float32, requestedLayers int) (gpuLayers ml.GPULayersList) {
+	if len(gpus) == 0 || len(layers) == 0 {
+		return nil
+	}
 	device := len(gpus) - 1
 	gpuLayers = ml.GPULayersList{{DeviceID: gpus[device].DeviceID}}
 	freeSpace := uint64(float64(gpus[device].FreeMemory) * float64(capacity))
@@ -1371,7 +1382,7 @@ func (s *llmServer) getServerStatus(ctx context.Context) (ServerStatus, error) {
 
 	switch ssr.Status {
 	case ServerStatusLoadingModel:
-		s.loadProgress = ssr.Progress
+		s.loadProgress.Store(math.Float32bits(ssr.Progress))
 		return ssr.Status, nil
 	case ServerStatusLaunched, ServerStatusReady, ServerStatusNoSlotsAvailable:
 		return ssr.Status, nil
@@ -1435,7 +1446,7 @@ func (s *llmServer) WaitUntilRunning(ctx context.Context) error {
 			if s.status != nil && s.status.LastErrMsg != "" {
 				msg = s.status.LastErrMsg
 			}
-			return fmt.Errorf("timed out waiting for llama runner to start - progress %0.2f - %s", s.loadProgress, msg)
+			return fmt.Errorf("timed out waiting for llama runner to start - progress %0.2f - %s", math.Float32frombits(s.loadProgress.Load()), msg)
 		}
 		if s.cmd.ProcessState != nil {
 			msg := ""
@@ -1446,7 +1457,7 @@ func (s *llmServer) WaitUntilRunning(ctx context.Context) error {
 		}
 		ctx, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
 		defer cancel()
-		priorProgress := s.loadProgress
+		priorProgress := math.Float32frombits(s.loadProgress.Load())
 		status, _ := s.getServerStatus(ctx)
 		if lastStatus != status && status != ServerStatusReady {
 			// Only log on status changes
@@ -1459,10 +1470,11 @@ func (s *llmServer) WaitUntilRunning(ctx context.Context) error {
 		default:
 			lastStatus = status
 			// Reset the timer as long as we're making forward progress on the load
-			if priorProgress != s.loadProgress {
-				slog.Debug(fmt.Sprintf("model load progress %0.2f", s.loadProgress))
+			currentProgress := math.Float32frombits(s.loadProgress.Load())
+			if priorProgress != currentProgress {
+				slog.Debug(fmt.Sprintf("model load progress %0.2f", currentProgress))
 				stallTimer = time.Now().Add(stallDuration)
-			} else if !fullyLoaded && int(s.loadProgress*100.0) >= 100 {
+			} else if !fullyLoaded && int(currentProgress*100.0) >= 100 {
 				slog.Debug("model load completed, waiting for server to become available", "status", status)
 				stallTimer = time.Now().Add(stallDuration)
 				fullyLoaded = true
@@ -1826,7 +1838,7 @@ func (s *llmServer) Embedding(ctx context.Context, input string) ([]float32, int
 
 	var e EmbeddingResponse
 	if err := json.Unmarshal(body, &e); err != nil {
-		return nil, 0, fmt.Errorf("unmarshal tokenize response: %w", err)
+		return nil, 0, fmt.Errorf("unmarshal embedding response: %w", err)
 	}
 
 	return e.Embedding, e.PromptEvalCount, nil
