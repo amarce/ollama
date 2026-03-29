@@ -49,38 +49,44 @@ void turboquant_decode_cuda(
     uint64_t rotation_seed,
     cudaStream_t stream);
 
+// Compute next power of 2 >= n (used for WHT padding)
+static inline int tq_next_pow2(int n) {
+    int p = 1;
+    while (p < n) p *= 2;
+    return p;
+}
+
 // Returns the number of bytes per element for TurboQuant at given bit width
-// This accounts for PolarQuant angles + QJL sign bits + metadata overhead
+// This accounts for PolarQuant angles + sign bit + QJL sign bits + metadata
 static inline float turboquant_bytes_per_element(int num_bits) {
-    // PolarQuant: num_bits per angular coordinate
-    // QJL residual: 1 bit per projection dimension
-    // Metadata: 4 bytes (magnitude + padding) per vector
-    //
-    // For a typical head_dim=128:
-    //   PolarQuant angles: 127 * num_bits bits (all but radius)
+    // Approximation for head_dim=128 (power-of-2, wht_size == head_dim):
+    //   Angles: (128-1) * num_bits bits
+    //   Last-component sign: 1 bit
     //   QJL signs: TQ_QJL_PROJ_DIM bits
-    //   Magnitude: 16 bits (fp16)
+    //   Metadata: 4 bytes (magnitude + padding) per vector
     //
-    // Per element (averaged over head_dim):
-    //   3-bit: (127*3 + 32 + 16) / (128*8) = 429/1024 ≈ 0.419 bytes/element
-    //   4-bit: (127*4 + 32 + 16) / (128*8) = 556/1024 ≈ 0.543 bytes/element
+    // Per element (averaged over head_dim=128):
+    //   3-bit: (127*3 + 1 + 32 + 32) / (128*8) = 447/1024 ≈ 0.437 bytes/element
+    //   4-bit: (127*4 + 1 + 32 + 32) / (128*8) = 573/1024 ≈ 0.560 bytes/element
     //
-    // Compared to fp16 at 2 bytes/element:
-    //   3-bit compression ratio: 2/0.419 ≈ 4.77x
-    //   With packed uint8 layout optimization: ~5.3x
-    float angle_bits = (float)num_bits;
+    // Non-power-of-2 head dims (e.g. 80) pad to wht_size (128) and store
+    // wht_size-1 angles, using proportionally more bits per input element.
+    float angle_bits = (float)num_bits;  // per angular coordinate
+    float sign_bit_per_elem = 1.0f / 128.0f;
     float jl_bits_per_elem = (float)TQ_QJL_PROJ_DIM / 128.0f;
-    float meta_bits_per_elem = 16.0f / 128.0f;  // fp16 magnitude spread over head_dim
-    float total_bits = angle_bits + jl_bits_per_elem + meta_bits_per_elem;
+    float meta_bits_per_elem = 32.0f / 128.0f;  // 4-byte header spread over head_dim
+    float total_bits = angle_bits + sign_bit_per_elem + jl_bits_per_elem + meta_bits_per_elem;
     return total_bits / 8.0f;
 }
 
 // Returns the compressed buffer size for a given KV cache shape
 static inline size_t turboquant_buffer_size(int head_dim, int num_kv_heads, int num_tokens, int num_bits) {
-    // Per vector: header (4 bytes) + packed angle bits + JL sign bits
-    size_t angle_bits_per_vec = (size_t)(head_dim - 1) * num_bits;
+    // WHT pads to next power of 2; we quantize all wht_size-1 angles + 1 sign bit
+    int wht_size = tq_next_pow2(head_dim);
+    size_t angle_bits_per_vec = (size_t)(wht_size - 1) * num_bits;
+    size_t sign_bits = 1;  // sign of last WHT component
     size_t jl_bits_per_vec = TQ_QJL_PROJ_DIM;
-    size_t total_bits_per_vec = angle_bits_per_vec + jl_bits_per_vec;
+    size_t total_bits_per_vec = angle_bits_per_vec + sign_bits + jl_bits_per_vec;
     // Round packed payload up to 4 bytes so 32-bit atomicOr in encode kernel
     // never writes past the vector boundary into the next vector's header.
     size_t packed_bytes = (total_bits_per_vec + 7) / 8;

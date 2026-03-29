@@ -11,6 +11,9 @@
 //
 // Reference: "TurboQuant: Online Vector Quantization with Near-optimal
 // Distortion Rate" (Google Research, ICLR 2026)
+//
+// Bitstream layout per vector (all wht_size = next-pow2(head_dim)):
+//   [header: 4B] [angles: (wht_size-1)*num_bits] [sign: 1] [jl: QJL_PROJ_DIM]
 // =============================================================================
 
 // ---------- Pseudo-random rotation via hash (deterministic, no state) --------
@@ -35,9 +38,44 @@ __device__ __forceinline__ float tq_randn(uint64_t seed, uint32_t idx) {
     return sqrtf(-2.0f * logf(u1)) * cosf(2.0f * 3.14159265358979323846f * u2);
 }
 
+// ---------- Shared-memory parallel reduction helper --------------------------
+
+// Parallel sum reduction using warp shuffles + cross-warp shared memory.
+// Returns the total sum (broadcast to all threads via shared memory).
+__device__ float tq_parallel_sum(float local_val) {
+    // Warp reduction
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+        local_val += __shfl_down_sync(0xFFFFFFFF, local_val, offset);
+    }
+
+    __shared__ float warp_sums_reduce[8];  // up to 256 threads (8 warps)
+    __shared__ float reduce_result;
+    int warp_id = threadIdx.x / warpSize;
+    int lane_id = threadIdx.x % warpSize;
+    if (lane_id == 0) {
+        warp_sums_reduce[warp_id] = local_val;
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        float total = 0.0f;
+        int num_warps = (blockDim.x + warpSize - 1) / warpSize;
+        for (int w = 0; w < num_warps; w++) {
+            total += warp_sums_reduce[w];
+        }
+        reduce_result = total;
+    }
+    __syncthreads();
+    return reduce_result;
+}
+
 // ---------- Stage 1: PolarQuant Encode/Decode --------------------------------
 
 // Encode kernel: apply random rotation, convert to polar, quantize angles
+//
+// Shared memory layout: [original: wht_size floats] [residual: wht_size floats]
+// The two-array design lets us compute the last component's residual exactly
+// by keeping the original WHT output intact while building dequantized values.
 __launch_bounds__(TQ_BLOCK_SIZE, 1)
 static __global__ void turboquant_encode_kernel(
     const half * __restrict__ src,
@@ -57,103 +95,75 @@ static __global__ void turboquant_encode_kernel(
     const int token_idx = vec_idx % batch_size;
     const int src_offset = token_idx * (head_dim * num_kv_heads) + head_idx * head_dim;
 
-    // Step 1: Load vector into shared memory and apply random rotation
+    // Compute padded size = next power of 2 >= head_dim
+    int wht_size = 1;
+    while (wht_size < head_dim) wht_size *= 2;
+
+    // Two shared memory arrays: original WHT output + residuals
     extern __shared__ float shared[];
-    float * rotated = shared;  // [head_dim]
+    float * original = shared;              // [wht_size]
+    float * residual = shared + wht_size;   // [wht_size]
 
     // Randomized Hadamard Transform (RHT):
     //   1. Apply random sign-flips: x'[i] = x[i] * s[i], s[i] in {-1, +1}
     //   2. Zero-pad to next power of 2 so all elements participate in WHT
     //   3. Apply in-place Walsh-Hadamard butterfly (orthogonal, O(n log n))
     //   4. Normalize by 1/sqrt(wht_size)
-    //
-    // Padding ensures non-power-of-2 head_dim (e.g. 80, 96) get a proper
-    // orthogonal rotation instead of leaving tail elements untransformed.
 
-    // Compute padded size = next power of 2 >= head_dim
-    int wht_size = 1;
-    while (wht_size < head_dim) wht_size *= 2;
-
-    // Step 1: Load + random sign flips, zero-pad tail
+    // Load + random sign flips, zero-pad tail
     for (int i = threadIdx.x; i < wht_size; i += blockDim.x) {
         if (i < head_dim) {
             uint32_t sign_bits = tq_hash(rotation_seed ^ (uint64_t)head_idx, (uint32_t)(i / 32));
             float sign = ((sign_bits >> (i & 31)) & 1) ? -1.0f : 1.0f;
-            rotated[i] = __half2float(src[src_offset + i]) * sign;
+            original[i] = __half2float(src[src_offset + i]) * sign;
         } else {
-            rotated[i] = 0.0f;  // zero-pad for WHT orthogonality
+            original[i] = 0.0f;  // zero-pad for WHT orthogonality
         }
     }
     __syncthreads();
 
-    // Step 2: In-place Walsh-Hadamard butterfly over padded size
-    for (int half = 1; half < wht_size; half *= 2) {
+    // In-place Walsh-Hadamard butterfly over padded size
+    for (int half_step = 1; half_step < wht_size; half_step *= 2) {
         for (int idx = threadIdx.x; idx < wht_size / 2; idx += blockDim.x) {
-            int block_start = (idx / half) * (half * 2);
-            int offset = idx % half;
+            int block_start = (idx / half_step) * (half_step * 2);
+            int offset = idx % half_step;
             int i0 = block_start + offset;
-            int i1 = i0 + half;
-            float a = rotated[i0];
-            float b = rotated[i1];
-            rotated[i0] = a + b;
-            rotated[i1] = a - b;
+            int i1 = i0 + half_step;
+            float a = original[i0];
+            float b = original[i1];
+            original[i0] = a + b;
+            original[i1] = a - b;
         }
         __syncthreads();
     }
 
-    // Normalize by 1/sqrt(wht_size) to make the transform orthogonal
+    // Normalize ALL wht_size elements by 1/sqrt(wht_size) to make the
+    // transform orthogonal.  Non-power-of-2 head_dim produces non-zero
+    // tail coefficients [head_dim..wht_size) that must be preserved.
     float inv_sqrt_n = rsqrtf((float)wht_size);
-    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
-        rotated[i] *= inv_sqrt_n;
+    for (int i = threadIdx.x; i < wht_size; i += blockDim.x) {
+        original[i] *= inv_sqrt_n;
     }
     __syncthreads();
 
-    // Step 2: Compute L2 norm (magnitude in polar coordinates)
+    // Compute L2 norm over all wht_size coefficients
+    // (orthogonal WHT preserves L2 norm, so this equals ||input||)
     float local_sum_sq = 0.0f;
-    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
-        local_sum_sq += rotated[i] * rotated[i];
+    for (int i = threadIdx.x; i < wht_size; i += blockDim.x) {
+        local_sum_sq += original[i] * original[i];
     }
+    float magnitude = sqrtf(tq_parallel_sum(local_sum_sq) + 1e-12f);
 
-    // Warp reduction for sum of squares
-    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
-        local_sum_sq += __shfl_down_sync(0xFFFFFFFF, local_sum_sq, offset);
-    }
-
-    // Cross-warp reduction: each warp leader writes its partial sum, then
-    // thread 0 accumulates all warp contributions to compute the full norm.
-    __shared__ float warp_sums[8]; // supports up to 256 threads (8 warps)
-    __shared__ float shared_norm;
-    int warp_id = threadIdx.x / warpSize;
-    int lane_id = threadIdx.x % warpSize;
-    if (lane_id == 0) {
-        warp_sums[warp_id] = local_sum_sq;
-    }
-    __syncthreads();
-
-    if (threadIdx.x == 0) {
-        float total = 0.0f;
-        int num_warps = (blockDim.x + warpSize - 1) / warpSize;
-        for (int w = 0; w < num_warps; w++) {
-            total += warp_sums[w];
-        }
-        shared_norm = sqrtf(total + 1e-12f);
-    }
-    __syncthreads();
-    float magnitude = shared_norm;
-
-    // Step 3: Quantize angular coordinates
-    // After rotation, coordinates follow a concentrated distribution
-    // Normalize to unit vector, then quantize each angular component to num_bits
+    // Quantize all wht_size-1 angular components
     int max_quant = (1 << num_bits) - 1;
 
     // Calculate output layout
-    size_t angle_bits_per_vec = (size_t)(head_dim - 1) * num_bits;
+    size_t angle_bits_per_vec = (size_t)(wht_size - 1) * num_bits;
+    size_t sign_bit_offset = angle_bits_per_vec;  // 1 bit for last-component sign
     size_t jl_bits_per_vec = TQ_QJL_PROJ_DIM;
-    size_t total_bits_per_vec = angle_bits_per_vec + jl_bits_per_vec;
-    // Round packed payload up to 4 bytes so 32-bit atomicOr never writes
-    // past this vector's allocation into the next vector's header/data.
+    size_t total_bits_per_vec = angle_bits_per_vec + 1 + jl_bits_per_vec;
     size_t packed_bytes = (total_bits_per_vec + 7) / 8;
-    packed_bytes = (packed_bytes + 3) & ~(size_t)3;
+    packed_bytes = (packed_bytes + 3) & ~(size_t)3;  // 4-byte align for atomicOr
     size_t bytes_per_vec = sizeof(turboquant_header) + packed_bytes;
 
     uint8_t * out_base = (uint8_t *)dst + vec_idx * bytes_per_vec;
@@ -166,23 +176,21 @@ static __global__ void turboquant_encode_kernel(
         hdr->reserved = 0;
     }
 
-    // Quantize angles and compute residuals in-place
-    // After quantization, rotated[] is repurposed to hold residuals for QJL,
-    // avoiding O(head_dim * proj_dim * num_bits) volatile bit reads in Stage 2.
-    for (int i = threadIdx.x; i < head_dim - 1; i += blockDim.x) {
-        float orig = rotated[i];
-        float normalized = (magnitude > 1e-12f) ? (orig / magnitude) : 0.0f;
-        // Clamp to [-1, 1] and map to [0, max_quant]
+    // Quantize all wht_size-1 angles, pack bits, and store dequantized values
+    // in residual[] (temporarily — will be converted to actual residuals below).
+    for (int i = threadIdx.x; i < wht_size - 1; i += blockDim.x) {
+        float val = original[i];
+        float normalized = (magnitude > 1e-12f) ? (val / magnitude) : 0.0f;
         normalized = fminf(fmaxf(normalized, -1.0f), 1.0f);
         int quantized = __float2int_rn((normalized + 1.0f) * 0.5f * (float)max_quant);
         quantized = min(max(quantized, 0), max_quant);
 
-        // Compute residual and store in shared memory for QJL stage
+        // Store dequantized value for later residual computation
         float dequant = ((float)quantized / (float)max_quant) * 2.0f - 1.0f;
         dequant *= magnitude;
-        rotated[i] = orig - dequant;  // repurpose as residual
+        residual[i] = dequant;
 
-        // Pack bits
+        // Pack quantized bits
         int bit_offset = i * num_bits;
         for (int b = 0; b < num_bits; b++) {
             int global_bit = bit_offset + b;
@@ -196,15 +204,48 @@ static __global__ void turboquant_encode_kernel(
     }
     __syncthreads();
 
+    // Store sign bit of last component (index wht_size-1).
+    // The decoder reconstructs magnitude via sqrt; this bit preserves the sign.
+    if (threadIdx.x == 0) {
+        if (original[wht_size - 1] < 0.0f) {
+            int global_bit = (int)sign_bit_offset;
+            int byte_idx = global_bit / 8;
+            int bit_idx = global_bit % 8;
+            atomicOr((unsigned int *)(packed_data + (byte_idx & ~3)),
+                     1u << (bit_idx + (byte_idx & 3) * 8));
+        }
+    }
+
+    // Reconstruct last component from unit-vector constraint + sign, then
+    // compute residuals for ALL wht_size components.
+    // sum_sq = Σ (dequant[i] / magnitude)² for i in [0, wht_size-2]
+    float local_dq_sq = 0.0f;
+    for (int i = threadIdx.x; i < wht_size - 1; i += blockDim.x) {
+        float norm_dq = (magnitude > 1e-12f) ? (residual[i] / magnitude) : 0.0f;
+        local_dq_sq += norm_dq * norm_dq;
+    }
+    float total_dq_sq = tq_parallel_sum(local_dq_sq);
+
+    // Compute dequantized last component and convert all to residuals
+    float last_sign = (original[wht_size - 1] < 0.0f) ? -1.0f : 1.0f;
+    float last_dequant = last_sign * sqrtf(fmaxf(1.0f - total_dq_sq, 0.0f)) * magnitude;
+
+    for (int i = threadIdx.x; i < wht_size - 1; i += blockDim.x) {
+        residual[i] = original[i] - residual[i];  // angle residual
+    }
+    if (threadIdx.x == 0) {
+        residual[wht_size - 1] = original[wht_size - 1] - last_dequant;
+    }
+    __syncthreads();
+
     // Stage 2: QJL residual encoding
-    // Project precomputed residuals through random Gaussian matrix and store signs.
-    // Residuals are already in rotated[] from Stage 1, so no packed bit reads needed.
-    int jl_bit_base = (int)angle_bits_per_vec;
+    // Project all wht_size residuals through random Gaussian matrix and store signs.
+    int jl_bit_base = (int)(sign_bit_offset + 1);  // after angles + sign bit
     for (int p = threadIdx.x; p < TQ_QJL_PROJ_DIM; p += blockDim.x) {
         float projection = 0.0f;
-        for (int j = 0; j < head_dim - 1; j++) {
-            float r = tq_randn(rotation_seed + 0xDEAD, (uint32_t)(p * head_dim + j));
-            projection += rotated[j] * r;
+        for (int j = 0; j < wht_size; j++) {
+            float r = tq_randn(rotation_seed + 0xDEAD, (uint32_t)(p * wht_size + j));
+            projection += residual[j] * r;
         }
 
         // Store sign bit
@@ -238,12 +279,16 @@ static __global__ void turboquant_decode_kernel(
     const int token_idx = vec_idx % count;
     const int dst_offset = token_idx * (head_dim * num_kv_heads) + head_idx * head_dim;
 
+    int wht_size = 1;
+    while (wht_size < head_dim) wht_size *= 2;
+
     int max_quant = (1 << num_bits) - 1;
 
-    size_t angle_bits_per_vec = (size_t)(head_dim - 1) * num_bits;
+    // Layout must match encode kernel
+    size_t angle_bits_per_vec = (size_t)(wht_size - 1) * num_bits;
+    size_t sign_bit_offset = angle_bits_per_vec;
     size_t jl_bits_per_vec = TQ_QJL_PROJ_DIM;
-    size_t total_bits_per_vec = angle_bits_per_vec + jl_bits_per_vec;
-    // Must match encode kernel's 4-byte aligned packed payload
+    size_t total_bits_per_vec = angle_bits_per_vec + 1 + jl_bits_per_vec;
     size_t packed_bytes = (total_bits_per_vec + 7) / 8;
     packed_bytes = (packed_bytes + 3) & ~(size_t)3;
     size_t bytes_per_vec = sizeof(turboquant_header) + packed_bytes;
@@ -255,10 +300,10 @@ static __global__ void turboquant_decode_kernel(
     float magnitude = __half2float(hdr->magnitude);
 
     extern __shared__ float shared[];
-    float * decoded = shared;  // [head_dim]
+    float * decoded = shared;  // [wht_size]
 
-    // Dequantize angular coordinates
-    for (int i = threadIdx.x; i < head_dim - 1; i += blockDim.x) {
+    // Dequantize all wht_size-1 angular coordinates
+    for (int i = threadIdx.x; i < wht_size - 1; i += blockDim.x) {
         int bit_offset = i * num_bits;
         int quant_val = 0;
         for (int b = 0; b < num_bits; b++) {
@@ -273,48 +318,29 @@ static __global__ void turboquant_decode_kernel(
         float normalized = ((float)quant_val / (float)max_quant) * 2.0f - 1.0f;
         decoded[i] = normalized * magnitude;
     }
+    __syncthreads();
 
-    // Reconstruct last dimension from unit-vector constraint
-    // Parallelized: each thread sums its slice, then warp+cross-warp reduce
-    __syncthreads();  // ensure all decoded[] writes are visible
-    {
-        float partial_sq = 0.0f;
-        for (int i = threadIdx.x; i < head_dim - 1; i += blockDim.x) {
-            float norm_i = (magnitude > 1e-12f) ? decoded[i] / magnitude : 0.0f;
-            partial_sq += norm_i * norm_i;
-        }
+    // Reconstruct last component from unit-vector constraint + stored sign bit
+    float local_dq_sq = 0.0f;
+    for (int i = threadIdx.x; i < wht_size - 1; i += blockDim.x) {
+        float norm_i = (magnitude > 1e-12f) ? decoded[i] / magnitude : 0.0f;
+        local_dq_sq += norm_i * norm_i;
+    }
+    float total_dq_sq = tq_parallel_sum(local_dq_sq);
 
-        // Warp reduction
-        for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
-            partial_sq += __shfl_down_sync(0xFFFFFFFF, partial_sq, offset);
-        }
-
-        // Cross-warp reduction (reuse warp_sums from shared memory)
-        __shared__ float warp_sums_decode[8];
-        __shared__ float shared_last_norm;
-        int warp_id = threadIdx.x / warpSize;
-        int lane_id = threadIdx.x % warpSize;
-        if (lane_id == 0) {
-            warp_sums_decode[warp_id] = partial_sq;
-        }
-        __syncthreads();
-
-        if (threadIdx.x == 0) {
-            float total_sq = 0.0f;
-            int num_warps = (blockDim.x + warpSize - 1) / warpSize;
-            for (int w = 0; w < num_warps; w++) {
-                total_sq += warp_sums_decode[w];
-            }
-            shared_last_norm = sqrtf(fmaxf(1.0f - total_sq, 0.0f));
-            decoded[head_dim - 1] = shared_last_norm * magnitude;
-        }
+    if (threadIdx.x == 0) {
+        // Read sign bit
+        int global_bit = (int)sign_bit_offset;
+        int byte_idx = global_bit / 8;
+        int bit_idx = global_bit % 8;
+        float last_sign = ((packed_data[byte_idx] >> bit_idx) & 1) ? -1.0f : 1.0f;
+        decoded[wht_size - 1] = last_sign * sqrtf(fmaxf(1.0f - total_dq_sq, 0.0f)) * magnitude;
     }
     __syncthreads();
 
     // Apply QJL correction (approximate residual recovery)
-    // The QJL sign bits allow an unbiased estimate of the residual direction
-    int jl_bit_base = (int)angle_bits_per_vec;
-    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+    int jl_bit_base = (int)(sign_bit_offset + 1);
+    for (int i = threadIdx.x; i < wht_size; i += blockDim.x) {
         float correction = 0.0f;
         for (int p = 0; p < TQ_QJL_PROJ_DIM; p++) {
             int global_bit = jl_bit_base + p;
@@ -322,11 +348,11 @@ static __global__ void turboquant_decode_kernel(
             int bit_idx = global_bit % 8;
             float sign = ((packed_data[byte_idx] >> bit_idx) & 1) ? 1.0f : -1.0f;
 
-            float r = tq_randn(rotation_seed + 0xDEAD, (uint32_t)(p * head_dim + i));
+            float r = tq_randn(rotation_seed + 0xDEAD, (uint32_t)(p * wht_size + i));
             correction += sign * r;
         }
         // Scale correction: expected quantization error ~ magnitude * 2^(-num_bits)
-        // divided by sqrt(proj_dim) for JL concentration. For 3-bit: ~magnitude/8.
+        // divided by sqrt(proj_dim) for JL concentration.
         float qjl_scale = magnitude / (float)(1 << num_bits) / sqrtf((float)TQ_QJL_PROJ_DIM);
         correction *= qjl_scale;
         decoded[i] += correction;
@@ -334,32 +360,20 @@ static __global__ void turboquant_decode_kernel(
     __syncthreads();
 
     // Inverse Randomized Hadamard Transform:
-    //   Must use same padded wht_size as encode (next power of 2 >= head_dim).
-    //   Zero-pad decoded[head_dim..wht_size) before inverse WHT, then only
-    //   output the first head_dim elements.
-    int wht_size_d = 1;
-    while (wht_size_d < head_dim) wht_size_d *= 2;
-
-    // Zero-pad tail for WHT (shared memory was only allocated for wht_size)
-    for (int i = threadIdx.x + head_dim; i < wht_size_d; i += blockDim.x) {
-        decoded[i] = 0.0f;
-    }
-    __syncthreads();
-
-    // Normalize by 1/sqrt(wht_size) (inverse of forward normalization)
-    float inv_sqrt_d = rsqrtf((float)wht_size_d);
-    for (int i = threadIdx.x; i < wht_size_d; i += blockDim.x) {
+    //   Same padded wht_size as encode. Normalize, butterfly, undo sign-flips.
+    //   Only output the first head_dim elements.
+    float inv_sqrt_d = rsqrtf((float)wht_size);
+    for (int i = threadIdx.x; i < wht_size; i += blockDim.x) {
         decoded[i] *= inv_sqrt_d;
     }
     __syncthreads();
 
-    // Walsh-Hadamard butterfly (same as forward — WHT is self-inverse up to scale)
-    for (int half = 1; half < wht_size_d; half *= 2) {
-        for (int idx = threadIdx.x; idx < wht_size_d / 2; idx += blockDim.x) {
-            int block_start = (idx / half) * (half * 2);
-            int offset = idx % half;
+    for (int half_step = 1; half_step < wht_size; half_step *= 2) {
+        for (int idx = threadIdx.x; idx < wht_size / 2; idx += blockDim.x) {
+            int block_start = (idx / half_step) * (half_step * 2);
+            int offset = idx % half_step;
             int i0 = block_start + offset;
-            int i1 = i0 + half;
+            int i1 = i0 + half_step;
             float a = decoded[i0];
             float b = decoded[i1];
             decoded[i0] = a + b;
@@ -368,8 +382,7 @@ static __global__ void turboquant_decode_kernel(
         __syncthreads();
     }
 
-    // Undo random sign-flips (self-inverse: multiply by same signs)
-    // Only output the first head_dim elements (ignore padding)
+    // Undo random sign-flips and write first head_dim elements to output
     for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
         uint32_t sign_bits = tq_hash(rotation_seed ^ (uint64_t)head_idx, (uint32_t)(i / 32));
         float sign = ((sign_bits >> (i & 31)) & 1) ? -1.0f : 1.0f;
@@ -396,17 +409,17 @@ void turboquant_encode_cuda(
     size_t buf_size = turboquant_buffer_size(head_dim, num_kv_heads, batch_size, num_bits);
     cudaMemsetAsync(dst, 0, buf_size, stream);
 
-    int block_size = min(TQ_BLOCK_SIZE, head_dim);
+    int wht_size = tq_next_pow2(head_dim);
+
+    int block_size = min(TQ_BLOCK_SIZE, wht_size);
     // Round up to next power of 2 for warp efficiency
     if (block_size < 32) block_size = 32;
     else if (block_size < 64) block_size = 64;
     else if (block_size < 128) block_size = 128;
     else block_size = 256;
 
-    // Shared memory must hold the WHT-padded array (next power of 2 >= head_dim)
-    int wht_size = 1;
-    while (wht_size < head_dim) wht_size *= 2;
-    size_t shared_mem = wht_size * sizeof(float);
+    // Encode needs two arrays: original[wht_size] + residual[wht_size]
+    size_t shared_mem = 2 * wht_size * sizeof(float);
 
     turboquant_encode_kernel<<<total_vecs, block_size, shared_mem, stream>>>(
         src, dst, head_dim, num_kv_heads, batch_size, num_bits, rotation_seed
@@ -426,15 +439,15 @@ void turboquant_decode_cuda(
     const int total_vecs = num_kv_heads * count;
     if (total_vecs == 0) return;
 
-    int block_size = min(TQ_BLOCK_SIZE, head_dim);
+    int wht_size = tq_next_pow2(head_dim);
+
+    int block_size = min(TQ_BLOCK_SIZE, wht_size);
     if (block_size < 32) block_size = 32;
     else if (block_size < 64) block_size = 64;
     else if (block_size < 128) block_size = 128;
     else block_size = 256;
 
-    // Shared memory must hold the WHT-padded array (next power of 2 >= head_dim)
-    int wht_size = 1;
-    while (wht_size < head_dim) wht_size *= 2;
+    // Decode needs one array: decoded[wht_size]
     size_t shared_mem = wht_size * sizeof(float);
 
     turboquant_decode_kernel<<<total_vecs, block_size, shared_mem, stream>>>(
