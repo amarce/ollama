@@ -916,15 +916,17 @@ func kvCacheBytesPerElement(cacheType string) float64 {
 	case "f32":
 		return 4 // f32 (default for recurrent)
 	case "turboquant", "turboquant3", "tq3":
-		// TurboQuant 3-bit: ~5.3x compression vs fp16
-		// Per head_dim=128 vector: (127*3 + 32 + 32) bits / (128*16 bits) * 2 bytes
-		return 2.0 / 5.3
+		// TurboQuant 3-bit: runtime currently uses Q4_0 as underlying storage
+		// while TurboQuant CUDA kernels handle encode/decode transparently.
+		// Use Q4_0 size (0.5 bytes/elem) for memory planning to match actual
+		// allocation and avoid VRAM overcommit.
+		return 0.5
 	case "turboquant4", "tq4":
-		// TurboQuant 4-bit: ~4.0x compression vs fp16
-		return 2.0 / 4.0
+		// TurboQuant 4-bit: uses Q4_0 underlying storage
+		return 0.5
 	case "turboquant2", "tq2":
-		// TurboQuant 2-bit: ~6.4x compression vs fp16 (aggressive)
-		return 2.0 / 6.4
+		// TurboQuant 2-bit: uses Q4_0 underlying storage
+		return 0.5
 	default:
 		return 2 // f16 (default)
 	}

@@ -1,19 +1,19 @@
 package turboquant
 
 import (
-	"math"
 	"testing"
 )
 
 func TestCompressionRatio(t *testing.T) {
+	// Theoretical compression ratios from PolarQuant + QJL
 	tests := []struct {
-		bits    int
+		bits     int
 		minRatio float64
 		maxRatio float64
 	}{
-		{2, 5.5, 7.0},  // ~6.4x
-		{3, 4.5, 5.8},  // ~5.3x
-		{4, 3.5, 4.5},  // ~4.0x
+		{2, 5.5, 7.0}, // ~6.4x
+		{3, 4.5, 5.8}, // ~5.3x
+		{4, 3.5, 4.5}, // ~4.0x
 	}
 
 	for _, tt := range tests {
@@ -27,9 +27,9 @@ func TestCompressionRatio(t *testing.T) {
 
 func TestParseConfig(t *testing.T) {
 	tests := []struct {
-		input    string
-		enabled  bool
-		numBits  int
+		input   string
+		enabled bool
+		numBits int
 	}{
 		{"", false, DefaultBits},
 		{"false", false, DefaultBits},
@@ -76,10 +76,19 @@ func TestEffectiveCompressionRatio(t *testing.T) {
 		t.Errorf("disabled config ratio = %f, want 1.0", r)
 	}
 
+	// Effective ratio should be 4.0 (Q4_0 underlying storage)
 	enabled := Config{Enabled: true, NumBits: 3}
 	r := enabled.EffectiveCompressionRatio()
-	if r < 4.0 || r > 6.0 {
-		t.Errorf("3-bit ratio = %f, want between 4.0 and 6.0", r)
+	if r != 4.0 {
+		t.Errorf("effective ratio = %f, want 4.0 (Q4_0 storage)", r)
+	}
+}
+
+func TestTheoreticalCompressionRatio(t *testing.T) {
+	enabled := Config{Enabled: true, NumBits: 3}
+	r := enabled.TheoreticalCompressionRatio()
+	if r < 4.5 || r > 5.8 {
+		t.Errorf("theoretical ratio = %f, want between 4.5 and 5.8", r)
 	}
 }
 
@@ -89,16 +98,17 @@ func TestBytesPerElement(t *testing.T) {
 		t.Errorf("disabled bytes/elem = %f, want 2.0", b)
 	}
 
+	// Should match Q4_0: 0.5 bytes per element
 	enabled := Config{Enabled: true, NumBits: 3}
 	b := enabled.BytesPerElement()
-	if b >= 2.0 || b <= 0.0 {
-		t.Errorf("3-bit bytes/elem = %f, want between 0 and 2.0", b)
+	if b != 0.5 {
+		t.Errorf("bytes/elem = %f, want 0.5 (Q4_0 storage)", b)
 	}
 
-	// Verify bytes/elem is consistent with compression ratio
+	// Verify consistency with effective ratio
 	ratio := enabled.EffectiveCompressionRatio()
 	expected := 2.0 / ratio
-	if math.Abs(b-expected) > 0.001 {
+	if b != expected {
 		t.Errorf("bytes/elem %f inconsistent with ratio %f (expected %f)", b, ratio, expected)
 	}
 }

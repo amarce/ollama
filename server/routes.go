@@ -1849,20 +1849,31 @@ func Serve(ln net.Listener) error {
 		s.defaultNumCtx = 4096
 	}
 
-	// If TurboQuant KV cache compression is enabled, scale the default context
-	// by the actual compression ratio. We use the measured ratio rather than
-	// assuming a theoretical maximum to avoid overcommitting memory.
+	// If TurboQuant KV cache compression is enabled AND we have CUDA GPUs,
+	// scale the default context by the actual compression ratio. We use the
+	// measured ratio rather than assuming a theoretical maximum to avoid
+	// overcommitting memory. Only apply when CUDA is present since TurboQuant
+	// compression runs exclusively on NVIDIA GPUs.
 	tqConfig := turboquant.ParseConfig(envconfig.TurboQuant())
 	if tqConfig.Enabled {
-		if err := tqConfig.Validate(); err != nil {
+		hasCUDA := false
+		for _, gpu := range gpus {
+			if gpu.Library == "cuda" {
+				hasCUDA = true
+				break
+			}
+		}
+		if !hasCUDA {
+			slog.Warn("turboquant enabled but no CUDA GPU detected, skipping context scaling")
+		} else if err := tqConfig.Validate(); err != nil {
 			slog.Warn("invalid turboquant config, ignoring", "error", err)
 		} else {
 			tqConfig.LogConfig()
 			ratio := tqConfig.EffectiveCompressionRatio()
 			// KV cache typically uses ~60-70% of model VRAM, so the effective
 			// context multiplier is less than the raw compression ratio.
-			// Use a conservative estimate: sqrt(ratio) as the context multiplier
-			// to avoid overcommitting. For 5.3x compression this gives ~2.3x context.
+			// Use a conservative estimate: ratio * 0.6 as the context multiplier
+			// to avoid overcommitting. For 5.3x compression this gives ~3.2x context.
 			contextMultiplier := ratio * 0.6 // 60% of VRAM goes to KV cache
 			if contextMultiplier < 1.0 {
 				contextMultiplier = 1.0

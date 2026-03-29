@@ -86,20 +86,36 @@ func (c Config) Validate() error {
 	return nil
 }
 
-// EffectiveCompressionRatio returns the compression ratio for this config
+// EffectiveCompressionRatio returns the actual runtime compression ratio.
+// Currently TurboQuant maps to Q4_0 as the underlying cache storage type,
+// so the effective ratio is 4x vs fp16 (0.5 bytes vs 2.0 bytes per element).
+// This is used for memory planning and context scaling to avoid VRAM overcommit.
 func (c Config) EffectiveCompressionRatio() float64 {
+	if !c.Enabled {
+		return 1.0
+	}
+	// Q4_0 underlying storage: 0.5 bytes/elem vs fp16 2.0 bytes/elem = 4x
+	return 4.0
+}
+
+// TheoreticalCompressionRatio returns the ideal TurboQuant compression ratio
+// based on PolarQuant + QJL encoding. This will be the effective ratio once
+// the CUDA kernels are fully wired into the cache Put/Get pipeline.
+func (c Config) TheoreticalCompressionRatio() float64 {
 	if !c.Enabled {
 		return 1.0
 	}
 	return CompressionRatio(c.NumBits)
 }
 
-// BytesPerElement returns the storage bytes per KV cache element under this config
+// BytesPerElement returns the storage bytes per KV cache element under this config.
+// Uses the actual runtime storage size (Q4_0) for accurate memory planning.
 func (c Config) BytesPerElement() float64 {
 	if !c.Enabled {
 		return 2.0 // fp16 default
 	}
-	return 2.0 / CompressionRatio(c.NumBits)
+	// Q4_0 storage: 0.5 bytes per element
+	return 0.5
 }
 
 // LogConfig logs the TurboQuant configuration details
@@ -107,10 +123,10 @@ func (c Config) LogConfig() {
 	if !c.Enabled {
 		return
 	}
-	ratio := c.EffectiveCompressionRatio()
 	slog.Info("turboquant kv cache compression enabled",
 		"bits", c.NumBits,
-		"compression_ratio", fmt.Sprintf("%.1fx", ratio),
+		"effective_ratio", fmt.Sprintf("%.1fx", c.EffectiveCompressionRatio()),
+		"theoretical_ratio", fmt.Sprintf("%.1fx", c.TheoreticalCompressionRatio()),
 		"bytes_per_element", fmt.Sprintf("%.3f", c.BytesPerElement()),
 	)
 }
