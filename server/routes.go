@@ -1855,19 +1855,13 @@ func Serve(ln net.Listener) error {
 	// Context scaling is only applied when flash attention is available,
 	// since quantized KV cache types require it.
 	tqValue := envconfig.TurboQuant()
-	kvCacheExplicit := envconfig.KvCacheType() != ""
-	tqConfig := turboquant.ParseConfig(tqValue)
-
-	// Auto-enable: if the user hasn't set OLLAMA_TURBOQUANT at all and hasn't
-	// set an explicit KV cache type, enable automatically on CUDA.
-	if tqValue == "" && !kvCacheExplicit {
-		for _, gpu := range gpus {
-			if strings.EqualFold(gpu.Library, "cuda") {
-				tqConfig = turboquant.Config{Enabled: true, NumBits: turboquant.DefaultBits}
-				slog.Info("turboquant auto-enabled (CUDA GPU detected)")
-				break
-			}
-		}
+	gpuLibraries := make([]string, len(gpus))
+	for i, gpu := range gpus {
+		gpuLibraries[i] = gpu.Library
+	}
+	tqConfig := turboquant.ShouldAutoEnable(tqValue, envconfig.KvCacheType(), gpuLibraries)
+	if tqConfig.Enabled && tqValue == "" {
+		slog.Info("turboquant auto-enabled (CUDA GPU detected)")
 	}
 
 	// Only scale context if flash attention will actually be available at

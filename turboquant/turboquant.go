@@ -16,6 +16,38 @@ import (
 	"strings"
 )
 
+// GPUInfo is the minimal GPU interface needed for auto-enable detection.
+// This avoids importing the ml package and creating a circular dependency.
+type GPUInfo interface {
+	GetLibrary() string
+}
+
+// ShouldAutoEnable returns true if TurboQuant should be auto-enabled based on
+// the environment variable value, explicit KV cache type, and available GPUs.
+// This consolidates the auto-enable decision into a single location.
+func ShouldAutoEnable(tqEnvValue string, kvCacheType string, gpuLibraries []string) Config {
+	config := ParseConfig(tqEnvValue)
+
+	// If user explicitly configured TurboQuant, respect their setting
+	if tqEnvValue != "" {
+		return config
+	}
+
+	// If user set an explicit KV cache type, don't override it
+	if kvCacheType != "" {
+		return config
+	}
+
+	// Auto-enable on CUDA GPUs
+	for _, lib := range gpuLibraries {
+		if strings.EqualFold(lib, "cuda") {
+			return Config{Enabled: true, NumBits: DefaultBits}
+		}
+	}
+
+	return config
+}
+
 // Compression bit-width presets
 const (
 	Bits2_5 = 2  // ~6.4x compression, marginal quality degradation
@@ -38,25 +70,21 @@ const QJLProjectionDim = 32
 //   - QJL sign bits (32 bits per vector)
 //   - Per-vector metadata (magnitude fp16 + padding = 4 bytes)
 //   - Compared against fp16 baseline (2 bytes per element)
-func CompressionRatio(numBits int) float64 {
-	// Typical head_dim=128:
-	//   angle_bits = (head_dim-1) * num_bits = 127 * num_bits
-	//   jl_bits = 32
-	//   meta_bits = 32 (4 bytes header)
-	//   total_bits_per_vec = 127*num_bits + 32 + 32
-	//   fp16_bits_per_vec = 128 * 16 = 2048
-	//
-	// With packed uint8 layout optimization the effective ratio improves slightly
-	headDim := 128.0
-	angleBits := (headDim - 1) * float64(numBits)
+// CompressionRatio returns the effective compression ratio for a given bit-width
+// and head dimension. If headDim is 0, the common default of 128 is used.
+func CompressionRatio(numBits int, headDim ...int) float64 {
+	hd := 128.0
+	if len(headDim) > 0 && headDim[0] > 0 {
+		hd = float64(headDim[0])
+	}
+
+	angleBits := (hd - 1) * float64(numBits)
 	jlBits := float64(QJLProjectionDim)
-	metaBits := 32.0 // 4 bytes header
+	metaBits := 32.0 // 4 bytes header (magnitude fp16 + padding)
 	totalBits := angleBits + jlBits + metaBits
-	fp16Bits := headDim * 16.0
+	fp16Bits := hd * 16.0
 
-	ratio := fp16Bits / totalBits
-
-	return ratio
+	return fp16Bits / totalBits
 }
 
 // Config holds TurboQuant compression configuration

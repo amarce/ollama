@@ -271,23 +271,17 @@ func NewLlamaServer(systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, modelPath st
 	// user's explicit setting. TurboQuant maps to Q4_0 (a quantized type),
 	// so flash attention must be enabled.
 	tqValue := envconfig.TurboQuant()
-	tqConfig := turboquant.ParseConfig(tqValue)
-
-	// Auto-enable if OLLAMA_TURBOQUANT is not set, CUDA GPUs are present,
-	// and no explicit KV cache type was requested by the user.
-	if tqValue == "" && kvct == "" {
-		for _, gpu := range gpus {
-			if strings.EqualFold(gpu.Library, "cuda") {
-				tqConfig = turboquant.Config{Enabled: true, NumBits: turboquant.DefaultBits}
-				break
-			}
-		}
+	tqGPULibs := make([]string, len(gpus))
+	for i, gpu := range gpus {
+		tqGPULibs[i] = gpu.Library
 	}
+	tqConfig := turboquant.ShouldAutoEnable(tqValue, kvct, tqGPULibs)
 
 	if tqConfig.Enabled {
 		if err := tqConfig.Validate(); err != nil {
 			slog.Warn("invalid turboquant config", "error", err)
-		} else if loadRequest.FlashAttention != ml.FlashAttentionEnabled {
+		} else if loadRequest.FlashAttention == ml.FlashAttentionDisabled {
+			// User explicitly disabled FA — can't use quantized KV cache
 			slog.Warn("turboquant requires flash attention; enable OLLAMA_FLASH_ATTENTION=1 to use turboquant")
 		} else {
 			hasCUDA := false
@@ -298,6 +292,15 @@ func NewLlamaServer(systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, modelPath st
 				}
 			}
 			if hasCUDA {
+				// When FA is Auto (unset), promote to Enabled so the runner
+				// applies quantized KV cache. Without this, Auto leaves the
+				// decision to the runner which may not enable FA, causing
+				// TurboQuant to be silently ignored while context was already
+				// scaled up — leading to OOM.
+				if loadRequest.FlashAttention == ml.FlashAttentionAuto {
+					slog.Info("turboquant promoting flash attention from auto to enabled")
+					loadRequest.FlashAttention = ml.FlashAttentionEnabled
+				}
 				tqCacheType := fmt.Sprintf("turboquant%d", tqConfig.NumBits)
 				slog.Info("turboquant enabled, overriding kv cache type",
 					"type", tqCacheType,
@@ -663,7 +666,7 @@ func (s *llamaServer) Load(ctx context.Context, systemInfo ml.SystemInfo, system
 	}
 
 	// On Metal there's no partial offload overhead
-	if len(gpus) > 0 && gpus[0].Library == "Metal" {
+	if len(gpus) > 0 && strings.EqualFold(gpus[0].Library, "Metal") {
 		graphPartialOffload = graphFullOffload
 	}
 
@@ -730,7 +733,7 @@ func (s *llamaServer) Load(ctx context.Context, systemInfo ml.SystemInfo, system
 
 	// mmap has issues with partial offloading on metal
 	for _, g := range gpus {
-		if g.Library == "Metal" &&
+		if strings.EqualFold(g.Library, "Metal") &&
 			uint64(s.options.NumGPU) > 0 &&
 			uint64(s.options.NumGPU) < s.totalLayers {
 			s.options.UseMMap = new(bool)
@@ -742,10 +745,10 @@ func (s *llamaServer) Load(ctx context.Context, systemInfo ml.SystemInfo, system
 	// Linux  with a model larger than free space, mmap leads to thrashing
 	// For CPU loads we want the memory to be allocated, not FS cache
 	totalSize, _ := s.MemorySize()
-	if (runtime.GOOS == "windows" && len(gpus) > 0 && gpus[0].Library == "CUDA" && s.options.UseMMap == nil) ||
+	if (runtime.GOOS == "windows" && len(gpus) > 0 && strings.EqualFold(gpus[0].Library, "CUDA") && s.options.UseMMap == nil) ||
 		(runtime.GOOS == "linux" && systemInfo.FreeMemory < totalSize && s.options.UseMMap == nil) ||
 		(len(gpus) == 0 && s.options.UseMMap == nil) ||
-		(len(gpus) > 0 && gpus[0].Library == "Vulkan" && s.options.UseMMap == nil) ||
+		(len(gpus) > 0 && strings.EqualFold(gpus[0].Library, "Vulkan") && s.options.UseMMap == nil) ||
 		(s.options.UseMMap != nil && !*s.options.UseMMap) {
 		s.loadRequest.UseMmap = false
 	}

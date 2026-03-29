@@ -579,11 +579,7 @@ iGPUScan:
 		go func() {
 			<-req.ctx.Done()
 			slog.Debug("context for request finished")
-			select {
-			case s.finishedReqCh <- req:
-			default:
-				slog.Warn("finishedReqCh full, request completion dropped", "model", req.model.ShortName)
-			}
+			s.finishedReqCh <- req
 		}()
 		req.successCh <- runner
 	}()
@@ -725,7 +721,7 @@ func (s *Scheduler) waitForVRAMRecovery(runner *runnerRef, runners []ml.Filtered
 
 	// CPU, Metal and iGPUs don't need checking, so no waiting required
 	if len(runner.gpus) == 0 || !runner.discreteGPUs ||
-		(len(runner.gpus) == 1 && runner.gpus[0].Library == "Metal") {
+		(len(runner.gpus) == 1 && strings.EqualFold(runner.gpus[0].Library, "Metal")) {
 		finished <- struct{}{}
 		slog.Debug("no need to wait for VRAM recovery", "runner", runner)
 		return finished
