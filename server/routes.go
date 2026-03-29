@@ -1878,7 +1878,7 @@ func Serve(ln net.Listener) error {
 			if contextMultiplier < 1.0 {
 				contextMultiplier = 1.0
 			}
-			newCtx := uint64(float64(s.defaultNumCtx) * contextMultiplier)
+			newCtx := int(float64(s.defaultNumCtx) * contextMultiplier)
 			slog.Info("turboquant context scaling",
 				"original_ctx", s.defaultNumCtx,
 				"compression_ratio", fmt.Sprintf("%.1fx", ratio),
