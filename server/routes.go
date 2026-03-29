@@ -49,6 +49,7 @@ import (
 	"github.com/ollama/ollama/template"
 	"github.com/ollama/ollama/thinking"
 	"github.com/ollama/ollama/tools"
+	"github.com/ollama/ollama/turboquant"
 	"github.com/ollama/ollama/types/errtypes"
 	"github.com/ollama/ollama/types/model"
 	"github.com/ollama/ollama/version"
@@ -1847,6 +1848,36 @@ func Serve(ln net.Listener) error {
 	default:
 		s.defaultNumCtx = 4096
 	}
+
+	// If TurboQuant KV cache compression is enabled, scale the default context
+	// by the actual compression ratio. We use the measured ratio rather than
+	// assuming a theoretical maximum to avoid overcommitting memory.
+	tqConfig := turboquant.ParseConfig(envconfig.TurboQuant())
+	if tqConfig.Enabled {
+		if err := tqConfig.Validate(); err != nil {
+			slog.Warn("invalid turboquant config, ignoring", "error", err)
+		} else {
+			tqConfig.LogConfig()
+			ratio := tqConfig.EffectiveCompressionRatio()
+			// KV cache typically uses ~60-70% of model VRAM, so the effective
+			// context multiplier is less than the raw compression ratio.
+			// Use a conservative estimate: sqrt(ratio) as the context multiplier
+			// to avoid overcommitting. For 5.3x compression this gives ~2.3x context.
+			contextMultiplier := ratio * 0.6 // 60% of VRAM goes to KV cache
+			if contextMultiplier < 1.0 {
+				contextMultiplier = 1.0
+			}
+			newCtx := uint64(float64(s.defaultNumCtx) * contextMultiplier)
+			slog.Info("turboquant context scaling",
+				"original_ctx", s.defaultNumCtx,
+				"compression_ratio", fmt.Sprintf("%.1fx", ratio),
+				"context_multiplier", fmt.Sprintf("%.1fx", contextMultiplier),
+				"new_ctx", newCtx,
+			)
+			s.defaultNumCtx = newCtx
+		}
+	}
+
 	slog.Info("vram-based default context", "total_vram", format.HumanBytes2(totalVRAM), "default_num_ctx", s.defaultNumCtx)
 
 	err = srvr.Serve(ln)

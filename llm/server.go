@@ -35,6 +35,7 @@ import (
 	"github.com/ollama/ollama/ml"
 	"github.com/ollama/ollama/model"
 	"github.com/ollama/ollama/tokenizer"
+	"github.com/ollama/ollama/turboquant"
 )
 
 type filteredEnv []string
@@ -256,6 +257,35 @@ func NewLlamaServer(systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, modelPath st
 			}
 		} else if kvct != "" && kvct != "f16" {
 			slog.Warn("quantized kv cache requested but flash attention disabled", "type", kvct)
+		}
+	}
+
+	// TurboQuant KV cache compression override
+	// When OLLAMA_TURBOQUANT is set and a CUDA GPU is available, override the
+	// KV cache type to use TurboQuant compression. This is independent of
+	// flash attention since TurboQuant handles its own compression/decompression.
+	tqConfig := turboquant.ParseConfig(envconfig.TurboQuant())
+	if tqConfig.Enabled {
+		if err := tqConfig.Validate(); err != nil {
+			slog.Warn("invalid turboquant config", "error", err)
+		} else {
+			hasCUDA := false
+			for _, gpu := range gpus {
+				if gpu.Library == "cuda" {
+					hasCUDA = true
+					break
+				}
+			}
+			if hasCUDA {
+				tqCacheType := fmt.Sprintf("turboquant%d", tqConfig.NumBits)
+				slog.Info("turboquant enabled, overriding kv cache type",
+					"type", tqCacheType,
+					"compression_ratio", fmt.Sprintf("%.1fx", tqConfig.EffectiveCompressionRatio()),
+				)
+				loadRequest.KvCacheType = tqCacheType
+			} else {
+				slog.Warn("turboquant requires CUDA GPU, falling back to default kv cache")
+			}
 		}
 	}
 

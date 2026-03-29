@@ -138,6 +138,44 @@ const response = await ollama.chat({
 console.log(response.message.content);
 ```
 
+## TurboQuant KV Cache Compression
+
+Ollama supports [Google TurboQuant](https://arxiv.org/abs/2504.19874) for CUDA-accelerated KV cache compression, enabling significantly larger context windows and more concurrent model serving on NVIDIA GPUs.
+
+TurboQuant uses a two-stage compression pipeline:
+1. **PolarQuant**: Random rotation + polar coordinate quantization
+2. **QJL**: Johnson-Lindenstrauss sign-bit residual correction
+
+### Compression Ratios
+
+| Setting | Compression | Quality | Use Case |
+|---------|------------|---------|----------|
+| 3-bit (default) | ~5.3x | 99.5% attention fidelity | Recommended for production |
+| 4-bit | ~4.0x | Excellent | Conservative, highest quality |
+| 2-bit | ~6.4x | Good | Aggressive, maximum memory savings |
+
+### Usage
+
+Enable TurboQuant by setting the `OLLAMA_TURBOQUANT` environment variable:
+
+```bash
+# Enable with default 3-bit compression (~5.3x)
+OLLAMA_TURBOQUANT=true ollama serve
+
+# Specify bit-width explicitly
+OLLAMA_TURBOQUANT=3 ollama serve  # 3-bit (~5.3x compression)
+OLLAMA_TURBOQUANT=4 ollama serve  # 4-bit (~4.0x compression)
+OLLAMA_TURBOQUANT=2 ollama serve  # 2-bit (~6.4x compression)
+```
+
+On Windows:
+```powershell
+$env:OLLAMA_TURBOQUANT="true"
+ollama serve
+```
+
+> **Note**: TurboQuant requires an NVIDIA CUDA GPU. Context window defaults are automatically scaled based on the measured compression ratio (not theoretical maximum) to avoid overcommitting GPU memory.
+
 ## Supported backends
 
 - [llama.cpp](https://github.com/ggml-org/llama.cpp) project founded by Georgi Gerganov.

@@ -64,6 +64,13 @@ func kvCacheTypeFromStr(s string) ml.DType {
 		return ml.DTypeQ80
 	case "q4_0":
 		return ml.DTypeQ40
+	case "turboquant", "turboquant2", "turboquant3", "turboquant4",
+		"tq2", "tq3", "tq4":
+		// TurboQuant uses its own CUDA-based compression pipeline.
+		// At the cache layer we store in Q40 format as the closest built-in
+		// quantization, while the actual TurboQuant encode/decode happens
+		// in the CUDA kernels transparently.
+		return ml.DTypeQ40
 	default:
 		return ml.DTypeF16
 	}

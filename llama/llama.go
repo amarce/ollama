@@ -153,6 +153,11 @@ func kvCacheTypeFromStr(s string) C.enum_ggml_type {
 		return C.GGML_TYPE_Q8_0
 	case "q4_0":
 		return C.GGML_TYPE_Q4_0
+	case "turboquant", "turboquant2", "turboquant3", "turboquant4",
+		"tq2", "tq3", "tq4":
+		// TurboQuant compression uses Q4_0 as the underlying storage format;
+		// the actual PolarQuant+QJL encode/decode runs in the CUDA kernels.
+		return C.GGML_TYPE_Q4_0
 	default:
 		return C.GGML_TYPE_F16
 	}

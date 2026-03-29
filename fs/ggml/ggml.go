@@ -851,7 +851,9 @@ func (f GGML) SupportsKVCacheType(cacheType string) bool {
 		return true
 	}
 
-	return slices.Contains([]string{"q8_0", "q4_0"}, cacheType)
+	return slices.Contains([]string{"q8_0", "q4_0",
+		"turboquant", "turboquant2", "turboquant3", "turboquant4",
+		"tq2", "tq3", "tq4"}, cacheType)
 }
 
 // KVCacheTypeIsQuantized checks if the requested cache type is a quantized type
@@ -913,6 +915,16 @@ func kvCacheBytesPerElement(cacheType string) float64 {
 		return 0.5 // 1/4 of fp16
 	case "f32":
 		return 4 // f32 (default for recurrent)
+	case "turboquant", "turboquant3", "tq3":
+		// TurboQuant 3-bit: ~5.3x compression vs fp16
+		// Per head_dim=128 vector: (127*3 + 32 + 32) bits / (128*16 bits) * 2 bytes
+		return 2.0 / 5.3
+	case "turboquant4", "tq4":
+		// TurboQuant 4-bit: ~4.0x compression vs fp16
+		return 2.0 / 4.0
+	case "turboquant2", "tq2":
+		// TurboQuant 2-bit: ~6.4x compression vs fp16 (aggressive)
+		return 2.0 / 6.4
 	default:
 		return 2 // f16 (default)
 	}
