@@ -72,7 +72,9 @@ Name: "{userprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFile
 
 [InstallDelete]
 Type: filesandordirs; Name: "{%TEMP}\ollama*"
-Type: filesandordirs; Name: "{app}\lib\ollama"
+; NOTE: Do NOT delete {app}\lib\ollama — preserve GPU backend libraries from
+; a prior official ollama install (CUDA, ROCm, Vulkan DLLs). Cross-compiled
+; TurboQuant builds cannot include these, so we must keep existing ones.
 Type: files; Name: "{%LOCALAPPDATA}\Ollama\updates"
 
 [Run]
