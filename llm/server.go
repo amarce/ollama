@@ -298,16 +298,31 @@ func NewLlamaServer(systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, modelPath st
 				// decision to the runner which may not enable FA, causing
 				// TurboQuant to be silently ignored while context was already
 				// scaled up — leading to OOM.
+				//
+				// Only promote if both GPU and model actually support FA.
+				// The fa/faUserSet checks above may have left flashAttention
+				// as Auto even when GPU or model doesn't support FA — promoting
+				// blindly would force a load path that fails at context init.
 				if loadRequest.FlashAttention == ml.FlashAttentionAuto {
-					slog.Info("turboquant promoting flash attention from auto to enabled")
-					loadRequest.FlashAttention = ml.FlashAttentionEnabled
+					if !ml.FlashAttentionSupported(gpus) {
+						slog.Warn("turboquant: cannot promote flash attention, GPU does not support it; falling back to default kv cache")
+					} else if !f.SupportsFlashAttention() {
+						slog.Warn("turboquant: cannot promote flash attention, model does not support it; falling back to default kv cache")
+					} else {
+						slog.Info("turboquant promoting flash attention from auto to enabled")
+						loadRequest.FlashAttention = ml.FlashAttentionEnabled
+					}
 				}
-				tqCacheType := fmt.Sprintf("turboquant%d", tqConfig.NumBits)
-				slog.Info("turboquant enabled, overriding kv cache type",
-					"type", tqCacheType,
-					"compression_ratio", fmt.Sprintf("%.1fx", tqConfig.EffectiveCompressionRatio()),
-				)
-				loadRequest.KvCacheType = tqCacheType
+
+				// Only apply TurboQuant KV cache if FA is confirmed enabled
+				if loadRequest.FlashAttention == ml.FlashAttentionEnabled {
+					tqCacheType := fmt.Sprintf("turboquant%d", tqConfig.NumBits)
+					slog.Info("turboquant enabled, overriding kv cache type",
+						"type", tqCacheType,
+						"compression_ratio", fmt.Sprintf("%.1fx", tqConfig.EffectiveCompressionRatio()),
+					)
+					loadRequest.KvCacheType = tqCacheType
+				}
 			} else {
 				slog.Warn("turboquant requires CUDA GPU, falling back to default kv cache")
 			}
