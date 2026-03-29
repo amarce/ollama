@@ -579,7 +579,11 @@ iGPUScan:
 		go func() {
 			<-req.ctx.Done()
 			slog.Debug("context for request finished")
-			s.finishedReqCh <- req
+			select {
+			case s.finishedReqCh <- req:
+			default:
+				slog.Warn("finishedReqCh full, request completion dropped", "model", req.model.ShortName)
+			}
 		}()
 		req.successCh <- runner
 	}()

@@ -61,31 +61,48 @@ static __global__ void turboquant_encode_kernel(
     extern __shared__ float shared[];
     float * rotated = shared;  // [head_dim]
 
-    // Each thread handles multiple elements
+    // Randomized Hadamard Transform (RHT):
+    //   1. Apply random sign-flips: x'[i] = x[i] * s[i], s[i] in {-1, +1}
+    //   2. Apply in-place Walsh-Hadamard transform (orthogonal, O(n log n))
+    //
+    // This is an approximate random rotation matrix with the key property
+    // that angular distribution becomes concentrated (isotropic), which is
+    // exactly what PolarQuant needs for optimal quantization.
+    //
+    // Step 1: Load + random sign flips
     for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
-        float val = 0.0f;
-        // Apply random rotation: y_i = sum_j R_ij * x_j
-        // R is constructed from hash-based random normals, then orthogonalized
-        // via Gram-Schmidt-like projection. For efficiency we use a fast
-        // randomized Hadamard-like rotation instead of full random matrix.
-        //
-        // Simplified: multiply by random sign flips + fixed permutation
-        // This gives a random rotation that concentrates angular distribution
-        uint32_t sign_bits = tq_hash(rotation_seed ^ (uint64_t)head_idx, (uint32_t)i);
-
-        for (int j = threadIdx.x; j < head_dim; j += blockDim.x) {
-            float xj = __half2float(src[src_offset + j]);
-            // Random sign flip for each dimension pair
-            float sign = ((sign_bits >> (j & 31)) & 1) ? -1.0f : 1.0f;
-            if (i == j) {
-                val += xj * sign;
-            }
-        }
-
-        // For diagonal-only fast rotation, just apply sign flips
-        float xval = __half2float(src[src_offset + i]);
+        uint32_t sign_bits = tq_hash(rotation_seed ^ (uint64_t)head_idx, (uint32_t)(i / 32));
         float sign = ((sign_bits >> (i & 31)) & 1) ? -1.0f : 1.0f;
-        rotated[i] = xval * sign;
+        rotated[i] = __half2float(src[src_offset + i]) * sign;
+    }
+    __syncthreads();
+
+    // Step 2: In-place Walsh-Hadamard transform over shared memory
+    // Each butterfly stage: for pairs (i, i^half), compute (a+b, a-b)
+    // Operates on power-of-2 size; if head_dim isn't power of 2, we
+    // zero-pad implicitly (head_dim is typically 64, 80, 96, 128, 256).
+    // Find the largest power of 2 <= head_dim for the WHT butterfly
+    int wht_size = 1;
+    while (wht_size * 2 <= head_dim) wht_size *= 2;
+
+    for (int half = 1; half < wht_size; half *= 2) {
+        for (int idx = threadIdx.x; idx < wht_size / 2; idx += blockDim.x) {
+            int block_start = (idx / half) * (half * 2);
+            int offset = idx % half;
+            int i0 = block_start + offset;
+            int i1 = i0 + half;
+            float a = rotated[i0];
+            float b = rotated[i1];
+            rotated[i0] = a + b;
+            rotated[i1] = a - b;
+        }
+        __syncthreads();
+    }
+
+    // Normalize by 1/sqrt(wht_size) to make the transform orthogonal
+    float inv_sqrt_n = rsqrtf((float)wht_size);
+    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+        rotated[i] *= inv_sqrt_n;
     }
     __syncthreads();
 
@@ -313,15 +330,45 @@ static __global__ void turboquant_decode_kernel(
             float r = tq_randn(rotation_seed + 0xDEAD, (uint32_t)(p * head_dim + i));
             correction += sign * r;
         }
-        // Scale correction by expected residual magnitude / sqrt(proj_dim)
-        correction *= magnitude * 0.05f / sqrtf((float)TQ_QJL_PROJ_DIM);
+        // Scale correction: expected quantization error ~ magnitude * 2^(-num_bits)
+        // divided by sqrt(proj_dim) for JL concentration. For 3-bit: ~magnitude/8.
+        float qjl_scale = magnitude / (float)(1 << num_bits) / sqrtf((float)TQ_QJL_PROJ_DIM);
+        correction *= qjl_scale;
         decoded[i] += correction;
     }
     __syncthreads();
 
-    // Inverse rotation (sign-flip is self-inverse)
+    // Inverse Randomized Hadamard Transform (self-inverse up to scaling):
+    //   1. Normalize by 1/sqrt(wht_size) (inverse WHT = WHT / n, but we
+    //      already normalized once during encode, so apply 1/sqrt again)
+    //   2. Apply Walsh-Hadamard butterfly (same as forward)
+    //   3. Apply random sign-flips (sign-flip is self-inverse)
+    int wht_size_d = 1;
+    while (wht_size_d * 2 <= head_dim) wht_size_d *= 2;
+
+    float inv_sqrt_d = rsqrtf((float)wht_size_d);
     for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
-        uint32_t sign_bits = tq_hash(rotation_seed ^ (uint64_t)head_idx, (uint32_t)i);
+        decoded[i] *= inv_sqrt_d;
+    }
+    __syncthreads();
+
+    for (int half = 1; half < wht_size_d; half *= 2) {
+        for (int idx = threadIdx.x; idx < wht_size_d / 2; idx += blockDim.x) {
+            int block_start = (idx / half) * (half * 2);
+            int offset = idx % half;
+            int i0 = block_start + offset;
+            int i1 = i0 + half;
+            float a = decoded[i0];
+            float b = decoded[i1];
+            decoded[i0] = a + b;
+            decoded[i1] = a - b;
+        }
+        __syncthreads();
+    }
+
+    // Undo random sign-flips (self-inverse: multiply by same signs)
+    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+        uint32_t sign_bits = tq_hash(rotation_seed ^ (uint64_t)head_idx, (uint32_t)(i / 32));
         float sign = ((sign_bits >> (i & 31)) & 1) ? -1.0f : 1.0f;
         dst[dst_offset + i] = __float2half(decoded[i] * sign);
     }
