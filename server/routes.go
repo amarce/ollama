@@ -1871,7 +1871,10 @@ func Serve(ln net.Listener) error {
 
 	// Only scale context if flash attention is not explicitly disabled,
 	// since TurboQuant maps to Q4_0 which requires FA at model-load time.
-	faExplicitlyOff := envconfig.FlashAttention(true) != envconfig.FlashAttention(false) && !envconfig.FlashAttention(false)
+	// FlashAttention(default) returns the env value if set, else the default.
+	// When both FlashAttention(true) and FlashAttention(false) return false,
+	// the user explicitly set OLLAMA_FLASH_ATTENTION=0.
+	faExplicitlyOff := envconfig.FlashAttention(true) == envconfig.FlashAttention(false) && !envconfig.FlashAttention(false)
 
 	if tqConfig.Enabled {
 		if faExplicitlyOff {

@@ -87,6 +87,7 @@ func (db *database) init() error {
 		cloud_setting_migrated BOOLEAN NOT NULL DEFAULT 0,
 		remote TEXT NOT NULL DEFAULT '', -- deprecated
 		auto_update_enabled BOOLEAN NOT NULL DEFAULT 1,
+		turboquant_enabled BOOLEAN NOT NULL DEFAULT 0,
 		schema_version INTEGER NOT NULL DEFAULT %d
 	);
 
