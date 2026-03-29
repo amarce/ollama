@@ -1,19 +1,19 @@
 ; Inno Setup Installer for Ollama TurboQuant Fork
 ;
-; Build with: docker run --rm -v .:/work amake/innosetup app/ollama-turboquant.iss
+; Build with: docker run --rm -v .:/work -e PKG_VERSION=2.0.3 amake/innosetup app/ollama-turboquant.iss
 
 #define MyAppName "Ollama"
-#define MyAppVersion "2.0.2-turboquant"
+#define MyAppVersion "2.0.3-turboquant"
 #define MyAppPublisher "Ollama TurboQuant Fork"
 #define MyAppURL "https://github.com/amarce/ollama"
-#define MyAppExeName "ollama.exe"
+#define MyAppExeName "ollama app.exe"
 #define MyIcon ".\assets\app.ico"
 
 [Setup]
 AppId={{44E83376-CE68-45EB-8FC1-393500EB558C}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
-VersionInfoVersion=2.0.2.0
+VersionInfoVersion=2.0.3.0
 AppPublisher={#MyAppPublisher}
 AppPublisherURL={#MyAppURL}
 AppSupportURL={#MyAppURL}
@@ -58,18 +58,17 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 [LangOptions]
 DialogFontSize=12
 
-#define MyTrayAppExeName "ollama app.exe"
-
 [Files]
-Source: "..\dist\windows-ollama-app-amd64.exe"; DestDir: "{app}"; DestName: "{#MyTrayAppExeName}"; Flags: ignoreversion 64bit; BeforeInstall: TaskKill('{#MyTrayAppExeName}')
+Source: "..\dist\windows-ollama-app-amd64.exe"; DestDir: "{app}"; DestName: "{#MyAppExeName}"; Flags: ignoreversion 64bit; BeforeInstall: TaskKill('{#MyAppExeName}')
 Source: "..\dist\windows-amd64\vc_redist.x64.exe"; DestDir: "{tmp}"; Check: vc_redist_needed(); Flags: deleteafterinstall
-Source: "..\dist\windows-amd64\ollama.exe"; DestDir: "{app}"; Flags: ignoreversion 64bit; BeforeInstall: TaskKill('{#MyAppExeName}')
+Source: "..\dist\windows-amd64\ollama.exe"; DestDir: "{app}"; Flags: ignoreversion 64bit; BeforeInstall: TaskKill('ollama.exe')
+Source: "..\dist\windows-amd64\lib\ollama\*"; DestDir: "{app}\lib\ollama\"; Flags: ignoreversion 64bit recursesubdirs skipifsourcedoesntexist
 Source: ".\assets\app.ico"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyTrayAppExeName}"; IconFilename: "{app}\app.ico"
-Name: "{app}\lib\{#MyAppName}"; Filename: "{app}\{#MyTrayAppExeName}"; IconFilename: "{app}\app.ico"
-Name: "{userprograms}\{#MyAppName}"; Filename: "{app}\{#MyTrayAppExeName}"; IconFilename: "{app}\app.ico"
+Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\app.ico"
+Name: "{app}\lib\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\app.ico"
+Name: "{userprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\app.ico"
 
 [InstallDelete]
 Type: filesandordirs; Name: "{%TEMP}\ollama*"
@@ -78,11 +77,11 @@ Type: files; Name: "{%LOCALAPPDATA}\Ollama\updates"
 
 [Run]
 Filename: "{tmp}\vc_redist.x64.exe"; Parameters: "/install /passive /norestart"; Check: vc_redist_needed(); StatusMsg: "Installing VC++ Redistributables..."; Flags: waituntilterminated
-Filename: "{cmd}"; Parameters: "/C set PATH={app};%PATH% & ""{app}\{#MyTrayAppExeName}"""; Flags: postinstall nowait runhidden
+Filename: "{cmd}"; Parameters: "/C set PATH={app};%PATH% & ""{app}\{#MyAppExeName}"""; Flags: postinstall nowait runhidden
 
 [UninstallRun]
-Filename: "taskkill"; Parameters: "/im ""{#MyTrayAppExeName}"" /f /t"; Flags: runhidden
 Filename: "taskkill"; Parameters: "/im ""{#MyAppExeName}"" /f /t"; Flags: runhidden
+Filename: "taskkill"; Parameters: "/im ""ollama.exe"" /f /t"; Flags: runhidden
 Filename: "{cmd}"; Parameters: "/c timeout 5"; Flags: runhidden
 
 [UninstallDelete]
@@ -90,15 +89,18 @@ Type: filesandordirs; Name: "{%TEMP}\ollama*"
 Type: filesandordirs; Name: "{%LOCALAPPDATA}\Ollama"
 Type: filesandordirs; Name: "{%LOCALAPPDATA}\Programs\Ollama"
 Type: filesandordirs; Name: "{%USERPROFILE}\.ollama\history"
+Type: filesandordirs; Name: "{userstartup}\{#MyAppName}.lnk"
 
 [Messages]
 WizardReady=Ollama TurboQuant
 ReadyLabel1=%nLet's get you up and running with your own large language models.%n%nTurboQuant KV cache compression auto-enables on NVIDIA CUDA GPUs.
+SetupAppRunningError=Another Ollama installer is running.%n%nPlease cancel or finish the other installer, then click OK to continue with this install, or Cancel to exit.
 
 [Registry]
 Root: HKCU; Subkey: "Environment"; \
     ValueType: expandsz; ValueName: "Path"; ValueData: "{olddata};{app}"; \
     Check: NeedsAddPath('{app}')
+; Register ollama:// URL protocol — points to tray app for OAuth/deep-link handling
 Root: HKCU; Subkey: "Software\Classes\ollama"; ValueType: string; ValueName: ""; ValueData: "URL:Ollama Protocol"; Flags: uninsdeletekey
 Root: HKCU; Subkey: "Software\Classes\ollama"; ValueType: string; ValueName: "URL Protocol"; ValueData: ""; Flags: uninsdeletekey
 Root: HKCU; Subkey: "Software\Classes\ollama\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#MyAppExeName}"" ""%1"""; Flags: uninsdeletekey
@@ -135,6 +137,9 @@ begin
       RegQueryDWordValue(HKEY_LOCAL_MACHINE, sRegKey, 'Bld', v3) and
       RegQueryDWordValue(HKEY_LOCAL_MACHINE, sRegKey, 'RBld', v4)) then
   begin
+    Log('VC Redist version: ' + IntToStr(v1) +
+        '.' + IntToStr(v2) + '.' + IntToStr(v3) +
+        '.' + IntToStr(v4));
     Result := not (
         (v1 > VCRTL_MIN_V1) or ((v1 = VCRTL_MIN_V1) and
          ((v2 > VCRTL_MIN_V2) or ((v2 = VCRTL_MIN_V2) and
@@ -143,6 +148,147 @@ begin
   end
   else
     Result := TRUE;
+end;
+
+function GetDirSize(Path: String): Int64;
+var
+  FindRec: TFindRec;
+  FilePath: string;
+  Size: Int64;
+begin
+  if FindFirst(Path + '\*', FindRec) then begin
+    Result := 0;
+    try
+      repeat
+        if (FindRec.Name <> '.') and (FindRec.Name <> '..') then begin
+          FilePath := Path + '\' + FindRec.Name;
+          if (FindRec.Attributes and FILE_ATTRIBUTE_DIRECTORY) <> 0 then begin
+            Size := GetDirSize(FilePath);
+          end else begin
+            Size := Int64(FindRec.SizeHigh) shl 32 + FindRec.SizeLow;
+          end;
+          Result := Result + Size;
+        end;
+      until not FindNext(FindRec);
+    finally
+      FindClose(FindRec);
+    end;
+  end else begin
+    Log(Format('Failed to list %s', [Path]));
+    Result := -1;
+  end;
+end;
+
+var
+  DeleteModelsChecked: Boolean;
+  ModelsDir: string;
+
+procedure InitializeUninstallProgressForm();
+var
+  UninstallPage: TNewNotebookPage;
+  UninstallButton: TNewButton;
+  DeleteModelsCheckbox: TNewCheckBox;
+  OriginalPageNameLabel: string;
+  OriginalPageDescriptionLabel: string;
+  OriginalCancelButtonEnabled: Boolean;
+  OriginalCancelButtonModalResult: Integer;
+  ctrl: TWinControl;
+  ModelsSize: Int64;
+begin
+  if not UninstallSilent then begin
+    ctrl := UninstallProgressForm.CancelButton;
+    UninstallButton := TNewButton.Create(UninstallProgressForm);
+    UninstallButton.Parent := UninstallProgressForm;
+    UninstallButton.Left := ctrl.Left - ctrl.Width - ScaleX(10);
+    UninstallButton.Top := ctrl.Top;
+    UninstallButton.Width := ctrl.Width;
+    UninstallButton.Height := ctrl.Height;
+    UninstallButton.TabOrder := ctrl.TabOrder;
+    UninstallButton.Caption := 'Uninstall';
+    UninstallButton.ModalResult := mrOK;
+    UninstallProgressForm.CancelButton.TabOrder := UninstallButton.TabOrder + 1;
+    UninstallPage := TNewNotebookPage.Create(UninstallProgressForm);
+    UninstallPage.Notebook := UninstallProgressForm.InnerNotebook;
+    UninstallPage.Parent := UninstallProgressForm.InnerNotebook;
+    UninstallPage.Align := alClient;
+    UninstallProgressForm.InnerNotebook.ActivePage := UninstallPage;
+
+    ctrl := UninstallProgressForm.StatusLabel;
+    with TNewStaticText.Create(UninstallProgressForm) do begin
+      Parent := UninstallPage;
+      Top := ctrl.Top;
+      Left := ctrl.Left;
+      Width := ctrl.Width;
+      Height := ctrl.Height;
+      AutoSize := False;
+      ShowAccelChar := False;
+      Caption := '';
+    end;
+
+    if (DirExists(GetEnv('USERPROFILE') + '\.ollama\models\blobs')) then begin
+      ModelsDir := GetEnv('USERPROFILE') + '\.ollama\models';
+      ModelsSize := GetDirSize(ModelsDir);
+    end;
+
+    DeleteModelsCheckbox := TNewCheckBox.Create(UninstallProgressForm);
+    DeleteModelsCheckbox.Parent := UninstallPage;
+    DeleteModelsCheckbox.Top := ctrl.Top + ScaleY(30);
+    DeleteModelsCheckbox.Left := ctrl.Left;
+    DeleteModelsCheckbox.Width := ScaleX(300);
+    if ModelsSize > 1024*1024*1024 then begin
+      DeleteModelsCheckbox.Caption := 'Remove models (' + IntToStr(ModelsSize/(1024*1024*1024)) + ' GB) ' + ModelsDir;
+    end else if ModelsSize > 1024*1024 then begin
+      DeleteModelsCheckbox.Caption := 'Remove models (' + IntToStr(ModelsSize/(1024*1024)) + ' MB) ' + ModelsDir;
+    end else begin
+      DeleteModelsCheckbox.Caption := 'Remove models ' + ModelsDir;
+    end;
+    DeleteModelsCheckbox.Checked := True;
+
+    OriginalPageNameLabel := UninstallProgressForm.PageNameLabel.Caption;
+    OriginalPageDescriptionLabel := UninstallProgressForm.PageDescriptionLabel.Caption;
+    OriginalCancelButtonEnabled := UninstallProgressForm.CancelButton.Enabled;
+    OriginalCancelButtonModalResult := UninstallProgressForm.CancelButton.ModalResult;
+
+    UninstallProgressForm.PageNameLabel.Caption := '';
+    UninstallProgressForm.PageDescriptionLabel.Caption := '';
+    UninstallProgressForm.CancelButton.Enabled := True;
+    UninstallProgressForm.CancelButton.ModalResult := mrCancel;
+
+    if UninstallProgressForm.ShowModal = mrCancel then Abort;
+
+    UninstallButton.Visible := False;
+    UninstallProgressForm.PageNameLabel.Caption := OriginalPageNameLabel;
+    UninstallProgressForm.PageDescriptionLabel.Caption := OriginalPageDescriptionLabel;
+    UninstallProgressForm.CancelButton.Enabled := OriginalCancelButtonEnabled;
+    UninstallProgressForm.CancelButton.ModalResult := OriginalCancelButtonModalResult;
+
+    UninstallProgressForm.InnerNotebook.ActivePage := UninstallProgressForm.InstallingPage;
+
+    if DeleteModelsCheckbox.Checked then begin
+      DeleteModelsChecked:=True;
+    end else begin
+      DeleteModelsChecked:=False;
+    end;
+  end;
+end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+begin
+  if CurUninstallStep = usDone then begin
+    if DeleteModelsChecked then begin
+      Log('user requested model cleanup');
+      if (VarIsEmpty(ModelsDir)) then begin
+        Log('cleaning up home directory models')
+        DelTree(GetEnv('USERPROFILE') + '\.ollama\models', True, True, True);
+      end else begin
+        Log('cleaning up custom directory models ' + ModelsDir)
+        DelTree(ModelsDir + '\blobs', True, True, True);
+        DelTree(ModelsDir + '\manifests', True, True, True);
+      end;
+    end else begin
+      Log('user requested to preserve model dir');
+    end;
+  end;
 end;
 
 procedure TaskKill(FileName: String);

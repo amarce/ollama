@@ -17,7 +17,7 @@ var ollamaExe []byte
 //go:embed app.ico
 var appIcon []byte
 
-const version = "2.0.2-turboquant"
+const version = "2.0.3-turboquant"
 const appName = "Ollama"
 
 var (
@@ -268,7 +268,7 @@ func broadcastSettingChange() {
 }
 
 func registerURLProtocol(installDir string) error {
-	appExe := filepath.Join(installDir, "ollama.exe")
+	appExe := filepath.Join(installDir, "ollama app.exe")
 	if err := regCreateAndSet(HKEY_CURRENT_USER, `Software\Classes\ollama`, "", "URL:Ollama Protocol"); err != nil {
 		return err
 	}

@@ -65,7 +65,7 @@ CC=x86_64-w64-mingw32-gcc \
 CXX=x86_64-w64-mingw32-g++ \
 GOOS=windows GOARCH=amd64 CGO_ENABLED=1 \
 go build -trimpath \
-  -ldflags "-s -w -X=github.com/ollama/ollama/version.Version=2.0.2-turboquant" \
+  -ldflags "-s -w -X=github.com/ollama/ollama/version.Version=2.0.3-turboquant" \
   -o dist/windows-amd64/ollama.exe .
 ```
 
@@ -79,8 +79,8 @@ CXX=x86_64-w64-mingw32-g++ \
 GOOS=windows GOARCH=amd64 CGO_ENABLED=1 \
 go build -trimpath \
   -ldflags "-s -w -H windowsgui \
-    -X=github.com/ollama/ollama/version.Version=2.0.2-turboquant \
-    -X=github.com/ollama/ollama/app/version.Version=2.0.2-turboquant" \
+    -X=github.com/ollama/ollama/version.Version=2.0.3-turboquant \
+    -X=github.com/ollama/ollama/app/version.Version=2.0.3-turboquant" \
   -o dist/windows-ollama-app-amd64.exe ./app/cmd/app/
 ```
 
@@ -105,7 +105,7 @@ chmod -R 777 dist/
 # Build the installer
 docker run --rm \
   -v "$(pwd):/work" \
-  -e PKG_VERSION=2.0.2 \
+  -e PKG_VERSION=2.0.3 \
   amake/innosetup app/ollama-turboquant.iss
 ```
 
