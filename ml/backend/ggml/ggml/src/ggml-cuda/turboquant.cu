@@ -162,13 +162,21 @@ static __global__ void turboquant_encode_kernel(
         hdr->reserved = 0;
     }
 
-    // Quantize angles: map normalized component from [-1,1] to [0, max_quant]
+    // Quantize angles and compute residuals in-place
+    // After quantization, rotated[] is repurposed to hold residuals for QJL,
+    // avoiding O(head_dim * proj_dim * num_bits) volatile bit reads in Stage 2.
     for (int i = threadIdx.x; i < head_dim - 1; i += blockDim.x) {
-        float normalized = (magnitude > 1e-12f) ? (rotated[i] / magnitude) : 0.0f;
+        float orig = rotated[i];
+        float normalized = (magnitude > 1e-12f) ? (orig / magnitude) : 0.0f;
         // Clamp to [-1, 1] and map to [0, max_quant]
         normalized = fminf(fmaxf(normalized, -1.0f), 1.0f);
         int quantized = __float2int_rn((normalized + 1.0f) * 0.5f * (float)max_quant);
         quantized = min(max(quantized, 0), max_quant);
+
+        // Compute residual and store in shared memory for QJL stage
+        float dequant = ((float)quantized / (float)max_quant) * 2.0f - 1.0f;
+        dequant *= magnitude;
+        rotated[i] = orig - dequant;  // repurpose as residual
 
         // Pack bits
         int bit_offset = i * num_bits;
@@ -182,39 +190,17 @@ static __global__ void turboquant_encode_kernel(
             }
         }
     }
+    __syncthreads();
 
     // Stage 2: QJL residual encoding
-    // Project quantization residual through random Gaussian matrix and store signs
-    //
-    // IMPORTANT: __syncthreads() + __threadfence_block() here ensures all
-    // atomicOr writes to packed_data from Stage 1 are visible before any
-    // thread reads packed_data bytes for residual reconstruction.
-    __syncthreads();
-    __threadfence_block();
-
+    // Project precomputed residuals through random Gaussian matrix and store signs.
+    // Residuals are already in rotated[] from Stage 1, so no packed bit reads needed.
     int jl_bit_base = (int)angle_bits_per_vec;
     for (int p = threadIdx.x; p < TQ_QJL_PROJ_DIM; p += blockDim.x) {
         float projection = 0.0f;
         for (int j = 0; j < head_dim - 1; j++) {
-            float orig = rotated[j];
-            // Reconstruct quantized value for residual
-            int bit_offset = j * num_bits;
-            int quant_val = 0;
-            for (int b = 0; b < num_bits; b++) {
-                int global_bit = bit_offset + b;
-                int byte_idx = global_bit / 8;
-                int bit_idx = global_bit % 8;
-                // Use volatile read to ensure we see the atomicOr writes
-                if ((((volatile uint8_t *)packed_data)[byte_idx] >> bit_idx) & 1) {
-                    quant_val |= (1 << b);
-                }
-            }
-            float dequant = ((float)quant_val / (float)max_quant) * 2.0f - 1.0f;
-            dequant *= magnitude;
-            float residual = orig - dequant;
-            // Random projection
             float r = tq_randn(rotation_seed + 0xDEAD, (uint32_t)(p * head_dim + j));
-            projection += residual * r;
+            projection += rotated[j] * r;
         }
 
         // Store sign bit
