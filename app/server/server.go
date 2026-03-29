@@ -240,6 +240,9 @@ func (s *Server) cmd(ctx context.Context) (*exec.Cmd, error) {
 	if settings.ContextLength > 0 {
 		env["OLLAMA_CONTEXT_LENGTH"] = strconv.Itoa(settings.ContextLength)
 	}
+	if settings.TurboQuantEnabled {
+		env["OLLAMA_TURBOQUANT"] = "true"
+	}
 	if cloudDisabled {
 		env["OLLAMA_NO_CLOUD"] = "1"
 	} else {

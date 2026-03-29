@@ -13,6 +13,7 @@ package turboquant
 import (
 	"fmt"
 	"log/slog"
+	"strings"
 )
 
 // Compression bit-width presets
@@ -139,10 +140,11 @@ func (c Config) LogConfig() {
 //   - "4": enabled with 4-bit
 //   - "2": enabled with 2-bit (aggressive)
 func ParseConfig(value string) Config {
-	switch value {
-	case "", "false", "0":
+	v := strings.TrimSpace(strings.ToLower(value))
+	switch v {
+	case "", "false", "0", "no", "off", "disable", "disabled":
 		return DefaultConfig()
-	case "true", "1":
+	case "true", "1", "yes", "on", "enable", "enabled":
 		return Config{Enabled: true, NumBits: DefaultBits}
 	case "2":
 		return Config{Enabled: true, NumBits: 2}
@@ -151,7 +153,7 @@ func ParseConfig(value string) Config {
 	case "4":
 		return Config{Enabled: true, NumBits: 4}
 	default:
-		slog.Warn("turboquant: unrecognized value, using default 3-bit", "value", value)
-		return Config{Enabled: true, NumBits: DefaultBits}
+		slog.Warn("turboquant: unrecognized value, defaulting to disabled", "value", value)
+		return DefaultConfig()
 	}
 }

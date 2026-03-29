@@ -39,7 +39,7 @@ func TestParseConfig(t *testing.T) {
 		{"2", true, 2},
 		{"3", true, 3},
 		{"4", true, 4},
-		{"unknown", true, 3}, // defaults to 3-bit
+		{"unknown", false, DefaultBits}, // unrecognized defaults to disabled
 	}
 
 	for _, tt := range tests {

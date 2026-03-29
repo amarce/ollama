@@ -409,6 +409,7 @@ export class Settings {
     WorkingDir: string;
     ContextLength: number;
     TurboEnabled: boolean;
+    TurboQuantEnabled: boolean;
     WebSearchEnabled: boolean;
     ThinkEnabled: boolean;
     ThinkLevel: string;
@@ -427,6 +428,7 @@ export class Settings {
         this.WorkingDir = source["WorkingDir"];
         this.ContextLength = source["ContextLength"];
         this.TurboEnabled = source["TurboEnabled"];
+        this.TurboQuantEnabled = source["TurboQuantEnabled"];
         this.WebSearchEnabled = source["WebSearchEnabled"];
         this.ThinkEnabled = source["ThinkEnabled"];
         this.ThinkLevel = source["ThinkLevel"];

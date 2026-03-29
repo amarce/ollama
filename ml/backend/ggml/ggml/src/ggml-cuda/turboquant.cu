@@ -27,10 +27,11 @@ __device__ __forceinline__ uint32_t tq_hash(uint64_t seed, uint32_t idx) {
 __device__ __forceinline__ float tq_randn(uint64_t seed, uint32_t idx) {
     uint32_t h1 = tq_hash(seed, idx * 2);
     uint32_t h2 = tq_hash(seed, idx * 2 + 1);
-    float u1 = (float)(h1 & 0x7FFFFF | 0x3F800000);  // [1, 2)
-    u1 = u1 - 1.0f;  // [0, 1)
+    // Use __uint_as_float for proper bit reinterpretation: set exponent to 127
+    // (biased) so the result is in [1.0, 2.0), then subtract 1 to get [0.0, 1.0)
+    float u1 = __uint_as_float((h1 & 0x7FFFFFu) | 0x3F800000u) - 1.0f;
     u1 = fmaxf(u1, 1e-7f);  // avoid log(0)
-    float u2 = (float)(h2 & 0xFFFFFF) / (float)0xFFFFFF;  // [0, 1]
+    float u2 = __uint_as_float((h2 & 0x7FFFFFu) | 0x3F800000u) - 1.0f;
     return sqrtf(-2.0f * logf(u1)) * cosf(2.0f * 3.14159265358979323846f * u2);
 }
 
@@ -99,9 +100,24 @@ static __global__ void turboquant_encode_kernel(
         local_sum_sq += __shfl_down_sync(0xFFFFFFFF, local_sum_sq, offset);
     }
 
+    // Cross-warp reduction: each warp leader writes its partial sum, then
+    // thread 0 accumulates all warp contributions to compute the full norm.
+    __shared__ float warp_sums[8]; // supports up to 256 threads (8 warps)
     __shared__ float shared_norm;
+    int warp_id = threadIdx.x / warpSize;
+    int lane_id = threadIdx.x % warpSize;
+    if (lane_id == 0) {
+        warp_sums[warp_id] = local_sum_sq;
+    }
+    __syncthreads();
+
     if (threadIdx.x == 0) {
-        shared_norm = sqrtf(local_sum_sq + 1e-12f);
+        float total = 0.0f;
+        int num_warps = (blockDim.x + warpSize - 1) / warpSize;
+        for (int w = 0; w < num_warps; w++) {
+            total += warp_sums[w];
+        }
+        shared_norm = sqrtf(total + 1e-12f);
     }
     __syncthreads();
     float magnitude = shared_norm;

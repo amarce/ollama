@@ -261,17 +261,31 @@ func NewLlamaServer(systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, modelPath st
 	}
 
 	// TurboQuant KV cache compression override
-	// When OLLAMA_TURBOQUANT is set and a CUDA GPU is available, override the
-	// KV cache type to use TurboQuant compression. This is independent of
-	// flash attention since TurboQuant handles its own compression/decompression.
-	tqConfig := turboquant.ParseConfig(envconfig.TurboQuant())
+	// Auto-enable on CUDA GPUs when not explicitly configured, or honour the
+	// user's explicit setting. TurboQuant maps to Q4_0 (a quantized type),
+	// so flash attention must be enabled.
+	tqValue := envconfig.TurboQuant()
+	tqConfig := turboquant.ParseConfig(tqValue)
+
+	// Auto-enable if OLLAMA_TURBOQUANT is not set and CUDA GPUs are present
+	if tqValue == "" {
+		for _, gpu := range gpus {
+			if strings.EqualFold(gpu.Library, "cuda") {
+				tqConfig = turboquant.Config{Enabled: true, NumBits: turboquant.DefaultBits}
+				break
+			}
+		}
+	}
+
 	if tqConfig.Enabled {
 		if err := tqConfig.Validate(); err != nil {
 			slog.Warn("invalid turboquant config", "error", err)
+		} else if loadRequest.FlashAttention != ml.FlashAttentionEnabled {
+			slog.Warn("turboquant requires flash attention; enable OLLAMA_FLASH_ATTENTION=1 to use turboquant")
 		} else {
 			hasCUDA := false
 			for _, gpu := range gpus {
-				if gpu.Library == "cuda" {
+				if strings.EqualFold(gpu.Library, "cuda") {
 					hasCUDA = true
 					break
 				}

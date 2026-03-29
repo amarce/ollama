@@ -1849,16 +1849,27 @@ func Serve(ln net.Listener) error {
 		s.defaultNumCtx = 4096
 	}
 
-	// If TurboQuant KV cache compression is enabled AND we have CUDA GPUs,
-	// scale the default context by the actual compression ratio. We use the
-	// measured ratio rather than assuming a theoretical maximum to avoid
-	// overcommitting memory. Only apply when CUDA is present since TurboQuant
-	// compression runs exclusively on NVIDIA GPUs.
-	tqConfig := turboquant.ParseConfig(envconfig.TurboQuant())
+	// TurboQuant KV cache compression: auto-enable on CUDA GPUs when not
+	// explicitly configured, or honour the user's explicit setting.
+	tqValue := envconfig.TurboQuant()
+	tqConfig := turboquant.ParseConfig(tqValue)
+
+	// Auto-enable: if the user hasn't set OLLAMA_TURBOQUANT at all, enable
+	// it automatically when CUDA GPUs are present.
+	if tqValue == "" {
+		for _, gpu := range gpus {
+			if strings.EqualFold(gpu.Library, "cuda") {
+				tqConfig = turboquant.Config{Enabled: true, NumBits: turboquant.DefaultBits}
+				slog.Info("turboquant auto-enabled (CUDA GPU detected)")
+				break
+			}
+		}
+	}
+
 	if tqConfig.Enabled {
 		hasCUDA := false
 		for _, gpu := range gpus {
-			if gpu.Library == "cuda" {
+			if strings.EqualFold(gpu.Library, "cuda") {
 				hasCUDA = true
 				break
 			}
