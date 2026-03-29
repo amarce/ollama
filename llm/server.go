@@ -10,6 +10,7 @@ import (
 	"io"
 	"log"
 	"log/slog"
+	"math"
 	"math/rand"
 	"net"
 	"net/http"
@@ -173,7 +174,12 @@ func NewLlamaServer(systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, modelPath st
 
 	opts.NumBatch = min(opts.NumBatch, opts.NumCtx)
 
-	loadRequest := LoadRequest{LoraPath: adapters, KvSize: opts.NumCtx * numParallel, BatchSize: opts.NumBatch, Parallel: numParallel, MultiUserCache: envconfig.MultiUserCache()}
+	kvSize := opts.NumCtx * numParallel
+	if numParallel > 0 && kvSize/numParallel != opts.NumCtx {
+		slog.Warn("KvSize overflow detected, clamping", "num_ctx", opts.NumCtx, "parallel", numParallel)
+		kvSize = math.MaxInt / 2 // safe large value that won't overflow downstream
+	}
+	loadRequest := LoadRequest{LoraPath: adapters, KvSize: kvSize, BatchSize: opts.NumBatch, Parallel: numParallel, MultiUserCache: envconfig.MultiUserCache()}
 
 	defaultThreads := systemInfo.ThreadCount
 	if opts.NumThread > 0 {
@@ -646,7 +652,11 @@ func (s *llamaServer) Load(ctx context.Context, systemInfo ml.SystemInfo, system
 			headsKV = 1
 		}
 		gqa := s.ggml.KV().HeadCountMax() / headsKV
-		graphPartialOffload = gqa * kvTotal / 6
+		if gqa > 0 && kvTotal > math.MaxUint64/gqa {
+			graphPartialOffload = math.MaxUint64 / 6 // saturate on overflow
+		} else {
+			graphPartialOffload = gqa * kvTotal / 6
+		}
 	}
 	if graphFullOffload == 0 {
 		graphFullOffload = graphPartialOffload
@@ -1013,7 +1023,7 @@ func (s *llmServer) buildLayout(systemGPUs []ml.DeviceInfo, memory *ml.BackendMe
 						lastUsedGPU = i
 					}
 
-					reserved := uint64(float32(gl[i].FreeMemory)*backoff) + gl[i].MinimumMemory() + envconfig.GpuOverhead() + memory.GPUs[j].Graph
+					reserved := uint64(float64(gl[i].FreeMemory)*float64(backoff)) + gl[i].MinimumMemory() + envconfig.GpuOverhead() + memory.GPUs[j].Graph
 					if gl[i].FreeMemory > reserved {
 						gl[i].FreeMemory -= reserved
 					} else {
@@ -1186,7 +1196,7 @@ func findBestFit(layers []uint64, gpus []ml.DeviceInfo, requestedLayers int, for
 func greedyFit(layers []uint64, gpus []ml.DeviceInfo, capacity float32, requestedLayers int) (gpuLayers ml.GPULayersList) {
 	device := len(gpus) - 1
 	gpuLayers = ml.GPULayersList{{DeviceID: gpus[device].DeviceID}}
-	freeSpace := uint64(float32(gpus[device].FreeMemory) * capacity)
+	freeSpace := uint64(float64(gpus[device].FreeMemory) * float64(capacity))
 	for i := len(layers) - 1; i >= 0; i-- {
 		if requestedLayers >= 0 && len(layers)-1-i >= requestedLayers {
 			break
@@ -1194,18 +1204,27 @@ func greedyFit(layers []uint64, gpus []ml.DeviceInfo, capacity float32, requeste
 
 		for {
 			if layers[i] <= freeSpace {
-				gpuLayers[0].Layers = append([]int{i}, gpuLayers[0].Layers...)
+				// Append in reverse order (O(1) amortized); reversed below
+				gpuLayers[0].Layers = append(gpuLayers[0].Layers, i)
 				freeSpace -= layers[i]
 				break
 			}
 
 			device--
 			if device < 0 {
+				// Reverse layers in each GPU entry before returning
+				for idx := range gpuLayers {
+					slices.Reverse(gpuLayers[idx].Layers)
+				}
 				return gpuLayers
 			}
 			gpuLayers = append(ml.GPULayersList{{DeviceID: gpus[device].DeviceID}}, gpuLayers...)
-			freeSpace = uint64(float32(gpus[device].FreeMemory) * capacity)
+			freeSpace = uint64(float64(gpus[device].FreeMemory) * float64(capacity))
 		}
+	}
+	// Reverse layers in each GPU entry to restore ascending order
+	for idx := range gpuLayers {
+		slices.Reverse(gpuLayers[idx].Layers)
 	}
 	return gpuLayers
 }

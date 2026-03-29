@@ -166,32 +166,36 @@ static __global__ void turboquant_encode_kernel(
 
     // Stage 2: QJL residual encoding
     // Project quantization residual through random Gaussian matrix and store signs
+    //
+    // IMPORTANT: __syncthreads() + __threadfence_block() here ensures all
+    // atomicOr writes to packed_data from Stage 1 are visible before any
+    // thread reads packed_data bytes for residual reconstruction.
     __syncthreads();
+    __threadfence_block();
 
     int jl_bit_base = (int)angle_bits_per_vec;
     for (int p = threadIdx.x; p < TQ_QJL_PROJ_DIM; p += blockDim.x) {
         float projection = 0.0f;
-        for (int j = 0; j < head_dim; j++) {
+        for (int j = 0; j < head_dim - 1; j++) {
             float orig = rotated[j];
             // Reconstruct quantized value for residual
-            if (j < head_dim - 1) {
-                int bit_offset = j * num_bits;
-                int quant_val = 0;
-                for (int b = 0; b < num_bits; b++) {
-                    int global_bit = bit_offset + b;
-                    int byte_idx = global_bit / 8;
-                    int bit_idx = global_bit % 8;
-                    if ((packed_data[byte_idx] >> bit_idx) & 1) {
-                        quant_val |= (1 << b);
-                    }
+            int bit_offset = j * num_bits;
+            int quant_val = 0;
+            for (int b = 0; b < num_bits; b++) {
+                int global_bit = bit_offset + b;
+                int byte_idx = global_bit / 8;
+                int bit_idx = global_bit % 8;
+                // Use volatile read to ensure we see the atomicOr writes
+                if ((((volatile uint8_t *)packed_data)[byte_idx] >> bit_idx) & 1) {
+                    quant_val |= (1 << b);
                 }
-                float dequant = ((float)quant_val / (float)max_quant) * 2.0f - 1.0f;
-                dequant *= magnitude;
-                float residual = orig - dequant;
-                // Random projection
-                float r = tq_randn(rotation_seed + 0xDEAD, (uint32_t)(p * head_dim + j));
-                projection += residual * r;
             }
+            float dequant = ((float)quant_val / (float)max_quant) * 2.0f - 1.0f;
+            dequant *= magnitude;
+            float residual = orig - dequant;
+            // Random projection
+            float r = tq_randn(rotation_seed + 0xDEAD, (uint32_t)(p * head_dim + j));
+            projection += residual * r;
         }
 
         // Store sign bit
@@ -259,14 +263,39 @@ static __global__ void turboquant_decode_kernel(
     }
 
     // Reconstruct last dimension from unit-vector constraint
-    if (threadIdx.x == 0) {
-        float sum_sq = 0.0f;
-        for (int i = 0; i < head_dim - 1; i++) {
+    // Parallelized: each thread sums its slice, then warp+cross-warp reduce
+    __syncthreads();  // ensure all decoded[] writes are visible
+    {
+        float partial_sq = 0.0f;
+        for (int i = threadIdx.x; i < head_dim - 1; i += blockDim.x) {
             float norm_i = (magnitude > 1e-12f) ? decoded[i] / magnitude : 0.0f;
-            sum_sq += norm_i * norm_i;
+            partial_sq += norm_i * norm_i;
         }
-        float last_norm = sqrtf(fmaxf(1.0f - sum_sq, 0.0f));
-        decoded[head_dim - 1] = last_norm * magnitude;
+
+        // Warp reduction
+        for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+            partial_sq += __shfl_down_sync(0xFFFFFFFF, partial_sq, offset);
+        }
+
+        // Cross-warp reduction (reuse warp_sums from shared memory)
+        __shared__ float warp_sums_decode[8];
+        __shared__ float shared_last_norm;
+        int warp_id = threadIdx.x / warpSize;
+        int lane_id = threadIdx.x % warpSize;
+        if (lane_id == 0) {
+            warp_sums_decode[warp_id] = partial_sq;
+        }
+        __syncthreads();
+
+        if (threadIdx.x == 0) {
+            float total_sq = 0.0f;
+            int num_warps = (blockDim.x + warpSize - 1) / warpSize;
+            for (int w = 0; w < num_warps; w++) {
+                total_sq += warp_sums_decode[w];
+            }
+            shared_last_norm = sqrtf(fmaxf(1.0f - total_sq, 0.0f));
+            decoded[head_dim - 1] = shared_last_norm * magnitude;
+        }
     }
     __syncthreads();
 

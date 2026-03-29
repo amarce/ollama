@@ -40,6 +40,7 @@ import (
 	internalcloud "github.com/ollama/ollama/internal/cloud"
 	"github.com/ollama/ollama/llm"
 	"github.com/ollama/ollama/logutil"
+	"github.com/ollama/ollama/ml"
 	"github.com/ollama/ollama/manifest"
 	"github.com/ollama/ollama/middleware"
 	"github.com/ollama/ollama/model/parsers"
@@ -1869,16 +1870,26 @@ func Serve(ln net.Listener) error {
 		}
 	}
 
-	// Only scale context if flash attention is not explicitly disabled,
-	// since TurboQuant maps to Q4_0 which requires FA at model-load time.
-	// FlashAttention(default) returns the env value if set, else the default.
-	// When both FlashAttention(true) and FlashAttention(false) return false,
-	// the user explicitly set OLLAMA_FLASH_ATTENTION=0.
+	// Only scale context if flash attention will actually be available at
+	// model-load time, since TurboQuant maps to Q4_0 which requires FA.
+	//
+	// We check three conditions:
+	//   1. User explicitly disabled FA via OLLAMA_FLASH_ATTENTION=0
+	//   2. GPUs don't support flash attention (driver/compute cap too low)
+	//   3. No CUDA GPU present
+	//
+	// In NewLlamaServer, FA can still be disabled by model-level checks
+	// (SupportsFlashAttention), but we can't know the model here. We guard
+	// against the runtime GPU capability check to avoid over-sizing context
+	// on systems where FA will be rejected later.
 	faExplicitlyOff := envconfig.FlashAttention(true) == envconfig.FlashAttention(false) && !envconfig.FlashAttention(false)
+	faGPUSupported := ml.FlashAttentionSupported(gpus)
 
 	if tqConfig.Enabled {
 		if faExplicitlyOff {
-			slog.Warn("turboquant enabled but flash attention is disabled; skipping context scaling")
+			slog.Warn("turboquant enabled but flash attention is explicitly disabled; skipping context scaling")
+		} else if !faGPUSupported {
+			slog.Warn("turboquant enabled but flash attention not supported by detected GPUs; skipping context scaling")
 		} else {
 			hasCUDA := false
 			for _, gpu := range gpus {
