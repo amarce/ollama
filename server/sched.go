@@ -331,12 +331,14 @@ func (s *Scheduler) processCompleted(ctx context.Context) {
 			runner.refMu.Lock()
 			if runner.refCount > 0 {
 				slog.Debug("expired event with positive ref count, retrying", "runner", runner, "refCount", runner.refCount)
-				go func(runner *runnerRef) {
+				runner.expiredRetries++
+				go func(runner *runnerRef, retries int) {
 					// We can't unload yet, but want to as soon as the current request completes
-					// So queue up another expired event
-					time.Sleep(10 * time.Millisecond)
+					// So queue up another expired event with exponential backoff (10ms, 20ms, 40ms, ... capped at 1s)
+					backoff := time.Duration(10<<uint(min(retries, 6))) * time.Millisecond
+					time.Sleep(backoff)
 					s.expiredCh <- runner
-				}(runner)
+				}(runner, runner.expiredRetries)
 				runner.refMu.Unlock()
 				continue
 			}
@@ -651,6 +653,7 @@ type runnerRef struct {
 	sessionDuration time.Duration
 	expireTimer     *time.Timer
 	expiresAt       time.Time
+	expiredRetries  int // tracks retry count for exponential backoff on busy unload
 
 	model       *Model
 	modelPath   string

@@ -454,6 +454,9 @@ func (a DeviceInfo) Compare(b DeviceInfo) DeviceComparison {
 // For a SameBackendDevice, return true if b is better than a
 // e.g. newer GPU library version
 func (a DeviceInfo) IsBetter(b DeviceInfo) bool {
+	if len(a.LibraryPath) == 0 || len(b.LibraryPath) == 0 {
+		return false
+	}
 	aLib := a.LibraryPath[len(a.LibraryPath)-1]
 	bLib := b.LibraryPath[len(b.LibraryPath)-1]
 	if aLib == bLib {

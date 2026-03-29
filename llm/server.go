@@ -815,7 +815,9 @@ func (s *ollamaServer) Load(ctx context.Context, systemInfo ml.SystemInfo, gpus 
 	var success bool
 	defer func() {
 		if !success {
-			s.initModel(ctx, LoadRequest{}, LoadOperationClose)
+			if _, err := s.initModel(ctx, LoadRequest{}, LoadOperationClose); err != nil {
+				slog.Warn("failed to close model during cleanup", "error", err)
+			}
 		}
 		if s.mem != nil {
 			s.mem.Log(slog.LevelInfo)
@@ -1455,10 +1457,10 @@ func (s *llmServer) WaitUntilRunning(ctx context.Context) error {
 			}
 			return fmt.Errorf("llama runner process no longer running: %d %s", s.cmd.ProcessState.ExitCode(), msg)
 		}
-		ctx, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
-		defer cancel()
+		sCtx, sCancel := context.WithTimeout(ctx, 200*time.Millisecond)
 		priorProgress := math.Float32frombits(s.loadProgress.Load())
-		status, _ := s.getServerStatus(ctx)
+		status, _ := s.getServerStatus(sCtx)
+		sCancel() // cancel immediately; don't defer in loop to avoid accumulating
 		if lastStatus != status && status != ServerStatusReady {
 			// Only log on status changes
 			slog.Info("waiting for server to become available", "status", status)
@@ -1888,6 +1890,9 @@ func (s *llamaServer) Detokenize(ctx context.Context, tokens []int) (string, err
 func (s *ollamaServer) Detokenize(ctx context.Context, tokens []int) (string, error) {
 	toks := make([]int32, len(tokens))
 	for i, t := range tokens {
+		if t > math.MaxInt32 || t < math.MinInt32 {
+			return "", fmt.Errorf("token id %d out of int32 range", t)
+		}
 		toks[i] = int32(t)
 	}
 
@@ -1907,7 +1912,7 @@ func (s *llmServer) Close() error {
 	}
 	s.llamaModelLock.Unlock()
 
-	if s.cmd != nil {
+	if s.cmd != nil && s.cmd.Process != nil {
 		slog.Debug("stopping llama server", "pid", s.Pid())
 		if err := s.cmd.Process.Kill(); err != nil {
 			return err

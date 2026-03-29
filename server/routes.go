@@ -594,6 +594,7 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 
 			if _, err := sb.WriteString(cr.Content); err != nil {
 				ch <- gin.H{"error": err.Error()}
+				return
 			}
 
 			if cr.Done {
@@ -636,12 +637,14 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 		var allLogprobs []api.Logprob
 		var sbThinking strings.Builder
 		var sbContent strings.Builder
+		gotResponse := false
 		for rr := range ch {
 			switch t := rr.(type) {
 			case api.GenerateResponse:
 				sbThinking.WriteString(t.Thinking)
 				sbContent.WriteString(t.Response)
 				r = t
+				gotResponse = true
 				// Accumulate logprobs from all chunks for non-streaming response
 				if len(t.Logprobs) > 0 {
 					allLogprobs = append(allLogprobs, t.Logprobs...)
@@ -663,6 +666,11 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 				c.JSON(http.StatusInternalServerError, gin.H{"error": "unexpected response"})
 				return
 			}
+		}
+
+		if !gotResponse {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "no response generated"})
+			return
 		}
 
 		r.Thinking = sbThinking.String()
@@ -1930,10 +1938,12 @@ func Serve(ln net.Listener) error {
 func waitForStream(c *gin.Context, ch chan any) {
 	c.Header("Content-Type", "application/json")
 	var latest api.ProgressResponse
+	gotProgress := false
 	for resp := range ch {
 		switch r := resp.(type) {
 		case api.ProgressResponse:
 			latest = r
+			gotProgress = true
 		case gin.H:
 			status, ok := r["status"].(int)
 			if !ok {
@@ -1951,6 +1961,10 @@ func waitForStream(c *gin.Context, ch chan any) {
 		}
 	}
 
+	if !gotProgress {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "no progress received"})
+		return
+	}
 	c.JSON(http.StatusOK, latest)
 }
 
@@ -1988,7 +2002,11 @@ func streamResponse(c *gin.Context, ch chan any) {
 
 		bts, err := json.Marshal(val)
 		if err != nil {
-			slog.Info(fmt.Sprintf("streamResponse: json.Marshal failed with %s", err))
+			slog.Error("streamResponse: json.Marshal failed", "error", err)
+			if errBytes, merr := json.Marshal(gin.H{"error": fmt.Sprintf("internal marshal error: %s", err)}); merr == nil {
+				errBytes = append(errBytes, '\n')
+				_, _ = w.Write(errBytes)
+			}
 			return false
 		}
 
@@ -2635,12 +2653,14 @@ func (s *Server) ChatHandler(c *gin.Context) {
 		var allLogprobs []api.Logprob
 		var sbThinking strings.Builder
 		var sbContent strings.Builder
+		gotResponse := false
 		for rr := range ch {
 			switch t := rr.(type) {
 			case api.ChatResponse:
 				sbThinking.WriteString(t.Message.Thinking)
 				sbContent.WriteString(t.Message.Content)
 				resp = t
+				gotResponse = true
 				if len(req.Tools) > 0 {
 					toolCalls = append(toolCalls, t.Message.ToolCalls...)
 				}
@@ -2665,6 +2685,11 @@ func (s *Server) ChatHandler(c *gin.Context) {
 				c.JSON(http.StatusInternalServerError, gin.H{"error": "unexpected response"})
 				return
 			}
+		}
+
+		if !gotResponse {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "no response generated"})
+			return
 		}
 
 		resp.Message.Content = sbContent.String()
