@@ -9,7 +9,12 @@
 
 ## Installation
 
-### Quick Install (PowerShell)
+### One-Click Installer
+
+1. Download `OllamaSetup-turboquant.exe`
+2. Run the installer — it extracts ollama.exe to `%LOCALAPPDATA%\Ollama`, adds it to PATH, and creates a Start Menu shortcut
+
+### PowerShell Script
 
 1. Download `ollama-windows-amd64-turboquant.zip`
 2. Extract to a directory
