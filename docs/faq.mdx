@@ -368,6 +368,34 @@ How much the cache quantization impacts the model's response quality will depend
 
 You may need to experiment with different quantization types to find the best balance between memory usage and quality.
 
+## What is TurboQuant? (fork feature)
+
+> This feature is only available in the [TurboQuant fork](https://github.com/amarce/ollama).
+
+TurboQuant is a CUDA-based KV cache compression feature that uses PolarQuant + QJL to reduce KV cache memory by up to ~5.3x (at 3-bit). This allows significantly larger context windows within the same VRAM. Unlike standard `OLLAMA_KV_CACHE_TYPE` quantization, TurboQuant uses a mathematically principled approach with residual correction to maintain quality.
+
+TurboQuant **auto-enables by default** on NVIDIA GPUs with Flash Attention support — no configuration needed. It can be controlled via:
+
+```shell
+# Auto (default)
+ollama serve
+
+# Force on
+OLLAMA_TURBOQUANT=true ollama serve
+
+# Force off
+OLLAMA_TURBOQUANT=false ollama serve
+```
+
+In the desktop app, use **Settings > TurboQuant** (Auto / On / Off).
+
+Requirements:
+- NVIDIA GPU with compute capability 7.0+ (RTX 20xx or newer, V100, A100, etc.)
+- Compute capability 7.2 (Xavier) is excluded
+- Model must support Flash Attention
+
+See the [context length](./context-length.mdx#turboquant-kv-cache-compression-fork-feature) and [GPU hardware](./gpu.mdx#turboquant-kv-cache-compression-fork-feature) docs for more details.
+
 ## Where can I find my Ollama Public Key?
 
 Your **Ollama Public Key** is the public part of the key pair that lets your local Ollama instance talk to [ollama.com](https://ollama.com).
