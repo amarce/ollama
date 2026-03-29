@@ -150,7 +150,11 @@ static __global__ void turboquant_encode_kernel(
     size_t angle_bits_per_vec = (size_t)(head_dim - 1) * num_bits;
     size_t jl_bits_per_vec = TQ_QJL_PROJ_DIM;
     size_t total_bits_per_vec = angle_bits_per_vec + jl_bits_per_vec;
-    size_t bytes_per_vec = sizeof(turboquant_header) + (total_bits_per_vec + 7) / 8;
+    // Round packed payload up to 4 bytes so 32-bit atomicOr never writes
+    // past this vector's allocation into the next vector's header/data.
+    size_t packed_bytes = (total_bits_per_vec + 7) / 8;
+    packed_bytes = (packed_bytes + 3) & ~(size_t)3;
+    size_t bytes_per_vec = sizeof(turboquant_header) + packed_bytes;
 
     uint8_t * out_base = (uint8_t *)dst + vec_idx * bytes_per_vec;
     turboquant_header * hdr = (turboquant_header *)out_base;
@@ -239,7 +243,10 @@ static __global__ void turboquant_decode_kernel(
     size_t angle_bits_per_vec = (size_t)(head_dim - 1) * num_bits;
     size_t jl_bits_per_vec = TQ_QJL_PROJ_DIM;
     size_t total_bits_per_vec = angle_bits_per_vec + jl_bits_per_vec;
-    size_t bytes_per_vec = sizeof(turboquant_header) + (total_bits_per_vec + 7) / 8;
+    // Must match encode kernel's 4-byte aligned packed payload
+    size_t packed_bytes = (total_bits_per_vec + 7) / 8;
+    packed_bytes = (packed_bytes + 3) & ~(size_t)3;
+    size_t bytes_per_vec = sizeof(turboquant_header) + packed_bytes;
 
     const uint8_t * in_base = (const uint8_t *)src + vec_idx * bytes_per_vec;
     const turboquant_header * hdr = (const turboquant_header *)in_base;

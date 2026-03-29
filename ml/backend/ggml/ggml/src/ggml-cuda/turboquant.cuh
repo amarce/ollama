@@ -81,7 +81,11 @@ static inline size_t turboquant_buffer_size(int head_dim, int num_kv_heads, int 
     size_t angle_bits_per_vec = (size_t)(head_dim - 1) * num_bits;
     size_t jl_bits_per_vec = TQ_QJL_PROJ_DIM;
     size_t total_bits_per_vec = angle_bits_per_vec + jl_bits_per_vec;
-    size_t bytes_per_vec = sizeof(turboquant_header) + (total_bits_per_vec + 7) / 8;
+    // Round packed payload up to 4 bytes so 32-bit atomicOr in encode kernel
+    // never writes past the vector boundary into the next vector's header.
+    size_t packed_bytes = (total_bits_per_vec + 7) / 8;
+    packed_bytes = (packed_bytes + 3) & ~(size_t)3;  // align to 4 bytes
+    size_t bytes_per_vec = sizeof(turboquant_header) + packed_bytes;
 
     return bytes_per_vec * num_kv_heads * num_tokens;
 }
