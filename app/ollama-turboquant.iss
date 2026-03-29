@@ -277,11 +277,11 @@ begin
   if CurUninstallStep = usDone then begin
     if DeleteModelsChecked then begin
       Log('user requested model cleanup');
-      if (VarIsEmpty(ModelsDir)) then begin
-        Log('cleaning up home directory models')
+      if (ModelsDir = '') then begin
+        Log('cleaning up home directory models');
         DelTree(GetEnv('USERPROFILE') + '\.ollama\models', True, True, True);
       end else begin
-        Log('cleaning up custom directory models ' + ModelsDir)
+        Log('cleaning up custom directory models ' + ModelsDir);
         DelTree(ModelsDir + '\blobs', True, True, True);
         DelTree(ModelsDir + '\manifests', True, True, True);
       end;
