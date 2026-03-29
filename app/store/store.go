@@ -152,8 +152,9 @@ type Settings struct {
 	// TurboEnabled indicates if Ollama Turbo features are enabled
 	TurboEnabled bool
 
-	// TurboQuantEnabled indicates if TurboQuant KV cache compression is enabled (CUDA only)
-	TurboQuantEnabled bool
+	// TurboQuantMode controls TurboQuant KV cache compression (CUDA only).
+	// 0 = auto (default: auto-enables on CUDA GPUs), 1 = force on, 2 = force off
+	TurboQuantMode int
 
 	// Maps gpt-oss specific frontend name' BrowserToolEnabled' to db field 'websearch_enabled'
 	WebSearchEnabled bool

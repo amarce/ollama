@@ -240,11 +240,12 @@ func (s *Server) cmd(ctx context.Context) (*exec.Cmd, error) {
 	if settings.ContextLength > 0 {
 		env["OLLAMA_CONTEXT_LENGTH"] = strconv.Itoa(settings.ContextLength)
 	}
-	if settings.TurboQuantEnabled {
+	switch settings.TurboQuantMode {
+	case 1: // force on
 		env["OLLAMA_TURBOQUANT"] = "true"
-	} else {
-		// Explicitly disable so auto-enable logic doesn't activate on CUDA
+	case 2: // force off
 		env["OLLAMA_TURBOQUANT"] = "false"
+	default: // 0 = auto: don't set env var, let ShouldAutoEnable() decide
 	}
 	if cloudDisabled {
 		env["OLLAMA_NO_CLOUD"] = "1"

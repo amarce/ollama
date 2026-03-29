@@ -196,7 +196,7 @@ export default function Settings() {
         // If context length or turboquant is being changed, show restart message
         if (
           (field === "ContextLength" && value !== settings.ContextLength) ||
-          (field === "TurboQuantEnabled" && value !== settings.TurboQuantEnabled)
+          (field === "TurboQuantMode" && value !== settings.TurboQuantMode)
         ) {
           setRestartMessage(true);
           // Hide restart message after 3 seconds
@@ -571,17 +571,24 @@ export default function Settings() {
                     <div>
                       <Label>TurboQuant KV cache compression</Label>
                       <Description>
-                        {settings.TurboQuantEnabled
-                          ? "Compresses KV cache ~4x on NVIDIA GPUs, allowing larger context windows. Requires CUDA and flash attention."
-                          : "Enable to compress KV cache memory on NVIDIA CUDA GPUs, allowing larger context windows within the same VRAM."}
+                        {settings.TurboQuantMode === 1
+                          ? "Forced on: compresses KV cache ~4x on NVIDIA GPUs. Requires CUDA and flash attention."
+                          : settings.TurboQuantMode === 2
+                            ? "Forced off: TurboQuant compression is disabled regardless of GPU."
+                            : "Auto: automatically enables on NVIDIA CUDA GPUs for ~4x KV cache compression."}
                       </Description>
                     </div>
                   </div>
                   <div className="flex-shrink-0">
-                    <Switch
-                      checked={settings.TurboQuantEnabled}
-                      onChange={(checked) => handleChange("TurboQuantEnabled", checked)}
-                    />
+                    <select
+                      value={settings.TurboQuantMode}
+                      onChange={(e) => handleChange("TurboQuantMode", parseInt(e.target.value))}
+                      className="rounded-lg border border-neutral-300 bg-white px-3 py-1.5 text-sm dark:border-neutral-600 dark:bg-neutral-700"
+                    >
+                      <option value={0}>Auto</option>
+                      <option value={1}>On</option>
+                      <option value={2}>Off</option>
+                    </select>
                   </div>
                 </div>
               </Field>
