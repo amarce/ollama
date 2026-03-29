@@ -16,6 +16,7 @@ import {
   CogIcon,
   ArrowLeftIcon,
   ArrowDownTrayIcon,
+  CpuChipIcon,
 } from "@heroicons/react/20/solid";
 import { Settings as SettingsType } from "@/gotypes";
 import { useNavigate } from "@tanstack/react-router";
@@ -192,8 +193,11 @@ export default function Settings() {
           [field]: value,
         });
 
-        // If context length is being changed, show restart message
-        if (field === "ContextLength" && value !== settings.ContextLength) {
+        // If context length or turboquant is being changed, show restart message
+        if (
+          (field === "ContextLength" && value !== settings.ContextLength) ||
+          (field === "TurboQuantMode" && value !== settings.TurboQuantMode)
+        ) {
           setRestartMessage(true);
           // Hide restart message after 3 seconds
           setTimeout(() => setRestartMessage(false), 3000);
@@ -556,6 +560,35 @@ export default function Settings() {
                         ]}
                       />
                     </div>
+                  </div>
+                </div>
+              </Field>
+              {/* TurboQuant KV Cache Compression */}
+              <Field>
+                <div className="flex items-start justify-between gap-4">
+                  <div className="flex items-start space-x-3 flex-1">
+                    <CpuChipIcon className="mt-1 h-5 w-5 flex-shrink-0 text-black dark:text-neutral-100" />
+                    <div>
+                      <Label>TurboQuant KV cache compression</Label>
+                      <Description>
+                        {settings.TurboQuantMode === 1
+                          ? "Forced on: compresses KV cache ~4x on NVIDIA GPUs. Requires CUDA and flash attention."
+                          : settings.TurboQuantMode === 2
+                            ? "Forced off: TurboQuant compression is disabled regardless of GPU."
+                            : "Auto: automatically enables on NVIDIA CUDA GPUs for ~4x KV cache compression."}
+                      </Description>
+                    </div>
+                  </div>
+                  <div className="flex-shrink-0">
+                    <select
+                      value={settings.TurboQuantMode}
+                      onChange={(e) => handleChange("TurboQuantMode", parseInt(e.target.value))}
+                      className="rounded-lg border border-neutral-300 bg-white px-3 py-1.5 text-sm dark:border-neutral-600 dark:bg-neutral-700"
+                    >
+                      <option value={0}>Auto</option>
+                      <option value={1}>On</option>
+                      <option value={2}>Off</option>
+                    </select>
                   </div>
                 </div>
               </Field>

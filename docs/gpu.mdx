@@ -36,6 +36,22 @@ Check your compute compatibility to see if your card is supported:
 
 For building locally to support older GPUs, see [developer](./development#linux-cuda-nvidia)
 
+### TurboQuant KV Cache Compression (fork feature)
+
+> This feature is only available in the [TurboQuant fork](https://github.com/amarce/ollama).
+
+On NVIDIA GPUs with compute capability 7.0+ (excluding 7.2), TurboQuant KV cache compression auto-enables by default. This compresses the KV cache by ~4x (effective, via Q4_0 storage), allowing significantly larger context windows within the same VRAM.
+
+TurboQuant requires Flash Attention support, which is automatically promoted from Auto to Enabled when both the GPU and model support it. No manual configuration is needed.
+
+Requirements:
+- NVIDIA GPU with compute capability 7.0+ (RTX 20xx series or newer, V100, A100, etc.)
+- Compute capability 7.2 (Xavier) is excluded
+- Model must support Flash Attention
+- Flash Attention must not be explicitly disabled (`OLLAMA_FLASH_ATTENTION=0`)
+
+To disable TurboQuant on a supported GPU: `OLLAMA_TURBOQUANT=false ollama serve`
+
 ### GPU Selection
 
 If you have multiple NVIDIA GPUs in your system and want to limit Ollama to use

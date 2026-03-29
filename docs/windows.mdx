@@ -71,6 +71,29 @@ The Ollama Windows installer registers an Uninstaller application. Under `Add or
   If you have [changed the OLLAMA_MODELS location](#changing-model-location), the installer will not remove your downloaded models
 </Note>
 
+## TurboQuant Fork Installation
+
+> This section applies to the [TurboQuant fork](https://github.com/amarce/ollama) only.
+
+To install the TurboQuant version (which adds automatic KV cache compression on NVIDIA GPUs):
+
+1. Download `OllamaSetup-turboquant.exe` from [Releases](https://github.com/amarce/ollama/releases/tag/v2.0.2-turboquant)
+2. Run the installer — it will:
+   - Stop any running Ollama processes
+   - Install `ollama.exe` to `%LOCALAPPDATA%\Programs\Ollama`
+   - Add the install directory to your user PATH
+   - Register the `ollama://` URL protocol
+   - Create a Start Menu shortcut
+
+The installer can upgrade an existing official Ollama installation in-place (same install directory).
+
+For unattended/scripted installs:
+```powershell
+OllamaSetup-turboquant.exe /VERYSILENT
+```
+
+TurboQuant auto-enables on NVIDIA CUDA GPUs with Flash Attention support. Control it via the desktop app Settings (Auto/On/Off dropdown) or the `OLLAMA_TURBOQUANT` environment variable.
+
 ## Standalone CLI
 
 The easiest way to install Ollama on Windows is to use the `OllamaSetup.exe`

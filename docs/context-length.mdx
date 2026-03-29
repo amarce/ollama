@@ -30,6 +30,38 @@ If editing the context length for Ollama is not possible, the context length can
 OLLAMA_CONTEXT_LENGTH=64000 ollama serve
 ```
 
+### TurboQuant KV cache compression (fork feature)
+
+> This feature is only available in the [TurboQuant fork](https://github.com/amarce/ollama).
+
+On NVIDIA CUDA GPUs, TurboQuant compression **auto-enables by default** to reduce KV cache memory usage by up to ~5.3x (at 3-bit), allowing larger context windows within the same VRAM budget. No configuration is needed — it activates automatically when a CUDA GPU with Flash Attention support is detected.
+
+To explicitly control it:
+```
+# Auto (default) — just run normally
+ollama serve
+
+# Force on
+OLLAMA_TURBOQUANT=true ollama serve
+
+# Force off
+OLLAMA_TURBOQUANT=false ollama serve
+```
+
+In the desktop app, use the **Settings > TurboQuant** dropdown (Auto / On / Off).
+
+When enabled, the default context length is automatically scaled based on the actual measured compression ratio. For example, with 3-bit TurboQuant on a 24 GiB GPU, the effective context can increase from 32k to approximately 100k tokens.
+
+| Bit-width | Compression | Effect on context |
+|-----------|------------|-------------------|
+| 3-bit (default) | ~5.3x | ~3.2x more context |
+| 4-bit | ~4.0x | ~2.4x more context |
+| 2-bit | ~6.4x | ~3.8x more context |
+
+TurboQuant will only scale context when all safety checks pass (GPU FA support, model FA support, user hasn't disabled FA). If any check fails, it falls back to standard context defaults.
+
+> Note: The context multiplier is less than the raw compression ratio because KV cache is only one component of GPU memory usage. The multiplier accounts for weights, compute graphs, and other allocations.
+
 ### Check allocated context length and model offloading
 For best performance, use the maximum context length for a model, and avoid offloading the model to CPU. Verify the split under `PROCESSOR` using `ollama ps`.
 ```

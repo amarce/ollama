@@ -40,6 +40,7 @@ import (
 	internalcloud "github.com/ollama/ollama/internal/cloud"
 	"github.com/ollama/ollama/llm"
 	"github.com/ollama/ollama/logutil"
+	"github.com/ollama/ollama/ml"
 	"github.com/ollama/ollama/manifest"
 	"github.com/ollama/ollama/middleware"
 	"github.com/ollama/ollama/model/parsers"
@@ -49,6 +50,7 @@ import (
 	"github.com/ollama/ollama/template"
 	"github.com/ollama/ollama/thinking"
 	"github.com/ollama/ollama/tools"
+	"github.com/ollama/ollama/turboquant"
 	"github.com/ollama/ollama/types/errtypes"
 	"github.com/ollama/ollama/types/model"
 	"github.com/ollama/ollama/version"
@@ -592,6 +594,7 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 
 			if _, err := sb.WriteString(cr.Content); err != nil {
 				ch <- gin.H{"error": err.Error()}
+				return
 			}
 
 			if cr.Done {
@@ -634,12 +637,14 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 		var allLogprobs []api.Logprob
 		var sbThinking strings.Builder
 		var sbContent strings.Builder
+		gotResponse := false
 		for rr := range ch {
 			switch t := rr.(type) {
 			case api.GenerateResponse:
 				sbThinking.WriteString(t.Thinking)
 				sbContent.WriteString(t.Response)
 				r = t
+				gotResponse = true
 				// Accumulate logprobs from all chunks for non-streaming response
 				if len(t.Logprobs) > 0 {
 					allLogprobs = append(allLogprobs, t.Logprobs...)
@@ -661,6 +666,11 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 				c.JSON(http.StatusInternalServerError, gin.H{"error": "unexpected response"})
 				return
 			}
+		}
+
+		if !gotResponse {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "no response generated"})
+			return
 		}
 
 		r.Thinking = sbThinking.String()
@@ -1847,6 +1857,72 @@ func Serve(ln net.Listener) error {
 	default:
 		s.defaultNumCtx = 4096
 	}
+
+	// TurboQuant KV cache compression: auto-enable on CUDA GPUs when not
+	// explicitly configured, or honour the user's explicit setting.
+	// Context scaling is only applied when flash attention is available,
+	// since quantized KV cache types require it.
+	tqValue := envconfig.TurboQuant()
+	gpuLibraries := make([]string, len(gpus))
+	for i, gpu := range gpus {
+		gpuLibraries[i] = gpu.Library
+	}
+	tqConfig := turboquant.ShouldAutoEnable(tqValue, envconfig.KvCacheType(), gpuLibraries)
+	if tqConfig.Enabled && tqValue == "" {
+		slog.Info("turboquant auto-enabled (CUDA GPU detected)")
+	}
+
+	// Only scale context if flash attention will actually be available at
+	// model-load time, since TurboQuant maps to Q4_0 which requires FA.
+	//
+	// We check three conditions:
+	//   1. User explicitly disabled FA via OLLAMA_FLASH_ATTENTION=0
+	//   2. GPUs don't support flash attention (driver/compute cap too low)
+	//   3. No CUDA GPU present
+	//
+	// In NewLlamaServer, FA can still be disabled by model-level checks
+	// (SupportsFlashAttention), but we can't know the model here. We guard
+	// against the runtime GPU capability check to avoid over-sizing context
+	// on systems where FA will be rejected later.
+	faExplicitlyOff := envconfig.FlashAttention(true) == envconfig.FlashAttention(false) && !envconfig.FlashAttention(false)
+	faGPUSupported := ml.FlashAttentionSupported(gpus)
+
+	if tqConfig.Enabled {
+		if faExplicitlyOff {
+			slog.Warn("turboquant enabled but flash attention is explicitly disabled; skipping context scaling")
+		} else if !faGPUSupported {
+			slog.Warn("turboquant enabled but flash attention not supported by detected GPUs; skipping context scaling")
+		} else {
+			hasCUDA := false
+			for _, gpu := range gpus {
+				if strings.EqualFold(gpu.Library, "cuda") {
+					hasCUDA = true
+					break
+				}
+			}
+			if !hasCUDA {
+				slog.Warn("turboquant enabled but no CUDA GPU detected, skipping context scaling")
+			} else if err := tqConfig.Validate(); err != nil {
+				slog.Warn("invalid turboquant config, ignoring", "error", err)
+			} else {
+				tqConfig.LogConfig()
+				ratio := tqConfig.EffectiveCompressionRatio()
+				contextMultiplier := ratio * 0.6
+				if contextMultiplier < 1.0 {
+					contextMultiplier = 1.0
+				}
+				newCtx := int(float64(s.defaultNumCtx) * contextMultiplier)
+				slog.Info("turboquant context scaling",
+					"original_ctx", s.defaultNumCtx,
+					"compression_ratio", fmt.Sprintf("%.1fx", ratio),
+					"context_multiplier", fmt.Sprintf("%.1fx", contextMultiplier),
+					"new_ctx", newCtx,
+				)
+				s.defaultNumCtx = newCtx
+			}
+		}
+	}
+
 	slog.Info("vram-based default context", "total_vram", format.HumanBytes2(totalVRAM), "default_num_ctx", s.defaultNumCtx)
 
 	err = srvr.Serve(ln)
@@ -1862,10 +1938,12 @@ func Serve(ln net.Listener) error {
 func waitForStream(c *gin.Context, ch chan any) {
 	c.Header("Content-Type", "application/json")
 	var latest api.ProgressResponse
+	gotProgress := false
 	for resp := range ch {
 		switch r := resp.(type) {
 		case api.ProgressResponse:
 			latest = r
+			gotProgress = true
 		case gin.H:
 			status, ok := r["status"].(int)
 			if !ok {
@@ -1883,6 +1961,10 @@ func waitForStream(c *gin.Context, ch chan any) {
 		}
 	}
 
+	if !gotProgress {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "no progress received"})
+		return
+	}
 	c.JSON(http.StatusOK, latest)
 }
 
@@ -1920,7 +2002,11 @@ func streamResponse(c *gin.Context, ch chan any) {
 
 		bts, err := json.Marshal(val)
 		if err != nil {
-			slog.Info(fmt.Sprintf("streamResponse: json.Marshal failed with %s", err))
+			slog.Error("streamResponse: json.Marshal failed", "error", err)
+			if errBytes, merr := json.Marshal(gin.H{"error": fmt.Sprintf("internal marshal error: %s", err)}); merr == nil {
+				errBytes = append(errBytes, '\n')
+				_, _ = w.Write(errBytes)
+			}
 			return false
 		}
 
@@ -2567,12 +2653,14 @@ func (s *Server) ChatHandler(c *gin.Context) {
 		var allLogprobs []api.Logprob
 		var sbThinking strings.Builder
 		var sbContent strings.Builder
+		gotResponse := false
 		for rr := range ch {
 			switch t := rr.(type) {
 			case api.ChatResponse:
 				sbThinking.WriteString(t.Message.Thinking)
 				sbContent.WriteString(t.Message.Content)
 				resp = t
+				gotResponse = true
 				if len(req.Tools) > 0 {
 					toolCalls = append(toolCalls, t.Message.ToolCalls...)
 				}
@@ -2597,6 +2685,11 @@ func (s *Server) ChatHandler(c *gin.Context) {
 				c.JSON(http.StatusInternalServerError, gin.H{"error": "unexpected response"})
 				return
 			}
+		}
+
+		if !gotResponse {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "no response generated"})
+			return
 		}
 
 		resp.Message.Content = sbContent.String()

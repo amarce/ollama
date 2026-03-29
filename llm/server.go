@@ -10,6 +10,7 @@ import (
 	"io"
 	"log"
 	"log/slog"
+	"math"
 	"math/rand"
 	"net"
 	"net/http"
@@ -22,6 +23,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sync/semaphore"
@@ -35,6 +37,7 @@ import (
 	"github.com/ollama/ollama/ml"
 	"github.com/ollama/ollama/model"
 	"github.com/ollama/ollama/tokenizer"
+	"github.com/ollama/ollama/turboquant"
 )
 
 type filteredEnv []string
@@ -102,8 +105,8 @@ type llmServer struct {
 	llamaModelLock *sync.Mutex
 
 	totalLayers  uint64
-	loadStart    time.Time // Record how long it took the model to load
-	loadProgress float32
+	loadStart    time.Time  // Record how long it took the model to load
+	loadProgress *atomic.Uint32 // stores float32 bits atomically via math.Float32bits/frombits
 
 	sem *semaphore.Weighted
 }
@@ -172,7 +175,12 @@ func NewLlamaServer(systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, modelPath st
 
 	opts.NumBatch = min(opts.NumBatch, opts.NumCtx)
 
-	loadRequest := LoadRequest{LoraPath: adapters, KvSize: opts.NumCtx * numParallel, BatchSize: opts.NumBatch, Parallel: numParallel, MultiUserCache: envconfig.MultiUserCache()}
+	kvSize := opts.NumCtx * numParallel
+	if numParallel > 0 && kvSize/numParallel != opts.NumCtx {
+		slog.Warn("KvSize overflow detected, clamping", "num_ctx", opts.NumCtx, "parallel", numParallel)
+		kvSize = math.MaxInt / 2 // safe large value that won't overflow downstream
+	}
+	loadRequest := LoadRequest{LoraPath: adapters, KvSize: kvSize, BatchSize: opts.NumBatch, Parallel: numParallel, MultiUserCache: envconfig.MultiUserCache()}
 
 	defaultThreads := systemInfo.ThreadCount
 	if opts.NumThread > 0 {
@@ -259,6 +267,68 @@ func NewLlamaServer(systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, modelPath st
 		}
 	}
 
+	// TurboQuant KV cache compression override
+	// Auto-enable on CUDA GPUs when not explicitly configured, or honour the
+	// user's explicit setting. TurboQuant maps to Q4_0 (a quantized type),
+	// so flash attention must be enabled.
+	tqValue := envconfig.TurboQuant()
+	tqGPULibs := make([]string, len(gpus))
+	for i, gpu := range gpus {
+		tqGPULibs[i] = gpu.Library
+	}
+	tqConfig := turboquant.ShouldAutoEnable(tqValue, kvct, tqGPULibs)
+
+	if tqConfig.Enabled {
+		if err := tqConfig.Validate(); err != nil {
+			slog.Warn("invalid turboquant config", "error", err)
+		} else if loadRequest.FlashAttention == ml.FlashAttentionDisabled {
+			// User explicitly disabled FA — can't use quantized KV cache
+			slog.Warn("turboquant requires flash attention; enable OLLAMA_FLASH_ATTENTION=1 to use turboquant")
+		} else {
+			hasCUDA := false
+			for _, gpu := range gpus {
+				if strings.EqualFold(gpu.Library, "cuda") {
+					hasCUDA = true
+					break
+				}
+			}
+			if hasCUDA {
+				// When FA is Auto (unset), promote to Enabled so the runner
+				// applies quantized KV cache. Without this, Auto leaves the
+				// decision to the runner which may not enable FA, causing
+				// TurboQuant to be silently ignored while context was already
+				// scaled up — leading to OOM.
+				//
+				// Only promote if both GPU and model actually support FA.
+				// The fa/faUserSet checks above may have left flashAttention
+				// as Auto even when GPU or model doesn't support FA — promoting
+				// blindly would force a load path that fails at context init.
+				if loadRequest.FlashAttention == ml.FlashAttentionAuto {
+					if !ml.FlashAttentionSupported(gpus) {
+						slog.Warn("turboquant: cannot promote flash attention, GPU does not support it; falling back to default kv cache")
+					} else if !f.SupportsFlashAttention() {
+						slog.Warn("turboquant: cannot promote flash attention, model does not support it; falling back to default kv cache")
+					} else {
+						slog.Info("turboquant promoting flash attention from auto to enabled")
+						loadRequest.FlashAttention = ml.FlashAttentionEnabled
+					}
+				}
+
+				// Only apply TurboQuant KV cache if FA is confirmed enabled
+				if loadRequest.FlashAttention == ml.FlashAttentionEnabled {
+					tqCacheType := fmt.Sprintf("turboquant%d", tqConfig.NumBits)
+					slog.Info("turboquant enabled, overriding kv cache type",
+						"type", tqCacheType,
+						"compression_ratio", fmt.Sprintf("%.1fx", tqConfig.EffectiveCompressionRatio()),
+					)
+					loadRequest.KvCacheType = tqCacheType
+				}
+			} else {
+				slog.Warn("turboquant requires CUDA GPU, falling back to default kv cache")
+			}
+		}
+	}
+
 	gpuLibs := ml.LibraryPaths(gpus)
 	status := NewStatusWriter(os.Stderr)
 	cmd, port, err := StartRunner(
@@ -281,6 +351,7 @@ func NewLlamaServer(systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, modelPath st
 		sem:            semaphore.NewWeighted(int64(numParallel)),
 		totalLayers:    f.KV().BlockCount() + 1,
 		loadStart:      time.Now(),
+		loadProgress:   &atomic.Uint32{},
 		done:           make(chan struct{}),
 	}
 
@@ -372,21 +443,16 @@ func StartRunner(ollamaEngine bool, modelPath string, gpuLibs []string, out io.W
 
 	cmd.Env = os.Environ()
 
+	var stdout, stderr io.ReadCloser
 	if out != nil {
-		stdout, err := cmd.StdoutPipe()
+		stdout, err = cmd.StdoutPipe()
 		if err != nil {
 			return nil, 0, fmt.Errorf("failed to spawn server stdout pipe: %w", err)
 		}
-		stderr, err := cmd.StderrPipe()
+		stderr, err = cmd.StderrPipe()
 		if err != nil {
 			return nil, 0, fmt.Errorf("failed to spawn server stderr pipe: %w", err)
 		}
-		go func() {
-			io.Copy(out, stdout) //nolint:errcheck
-		}()
-		go func() {
-			io.Copy(out, stderr) //nolint:errcheck
-		}()
 	}
 	cmd.SysProcAttr = LlamaServerSysProcAttr
 
@@ -435,6 +501,17 @@ func StartRunner(ollamaEngine bool, modelPath string, gpuLibs []string, out io.W
 	if err = cmd.Start(); err != nil {
 		return nil, 0, err
 	}
+
+	// Launch pipe copy goroutines only after successful Start to avoid leaks
+	if out != nil && stdout != nil && stderr != nil {
+		go func() {
+			io.Copy(out, stdout) //nolint:errcheck
+		}()
+		go func() {
+			io.Copy(out, stderr) //nolint:errcheck
+		}()
+	}
+
 	err = nil
 	return
 }
@@ -601,14 +678,18 @@ func (s *llamaServer) Load(ctx context.Context, systemInfo ml.SystemInfo, system
 			headsKV = 1
 		}
 		gqa := s.ggml.KV().HeadCountMax() / headsKV
-		graphPartialOffload = gqa * kvTotal / 6
+		if gqa > 0 && kvTotal > math.MaxUint64/gqa {
+			graphPartialOffload = math.MaxUint64 / 6 // saturate on overflow
+		} else {
+			graphPartialOffload = gqa * kvTotal / 6
+		}
 	}
 	if graphFullOffload == 0 {
 		graphFullOffload = graphPartialOffload
 	}
 
 	// On Metal there's no partial offload overhead
-	if len(gpus) > 0 && gpus[0].Library == "Metal" {
+	if len(gpus) > 0 && strings.EqualFold(gpus[0].Library, "Metal") {
 		graphPartialOffload = graphFullOffload
 	}
 
@@ -675,7 +756,7 @@ func (s *llamaServer) Load(ctx context.Context, systemInfo ml.SystemInfo, system
 
 	// mmap has issues with partial offloading on metal
 	for _, g := range gpus {
-		if g.Library == "Metal" &&
+		if strings.EqualFold(g.Library, "Metal") &&
 			uint64(s.options.NumGPU) > 0 &&
 			uint64(s.options.NumGPU) < s.totalLayers {
 			s.options.UseMMap = new(bool)
@@ -687,10 +768,10 @@ func (s *llamaServer) Load(ctx context.Context, systemInfo ml.SystemInfo, system
 	// Linux  with a model larger than free space, mmap leads to thrashing
 	// For CPU loads we want the memory to be allocated, not FS cache
 	totalSize, _ := s.MemorySize()
-	if (runtime.GOOS == "windows" && len(gpus) > 0 && gpus[0].Library == "CUDA" && s.options.UseMMap == nil) ||
+	if (runtime.GOOS == "windows" && len(gpus) > 0 && strings.EqualFold(gpus[0].Library, "CUDA") && s.options.UseMMap == nil) ||
 		(runtime.GOOS == "linux" && systemInfo.FreeMemory < totalSize && s.options.UseMMap == nil) ||
 		(len(gpus) == 0 && s.options.UseMMap == nil) ||
-		(len(gpus) > 0 && gpus[0].Library == "Vulkan" && s.options.UseMMap == nil) ||
+		(len(gpus) > 0 && strings.EqualFold(gpus[0].Library, "Vulkan") && s.options.UseMMap == nil) ||
 		(s.options.UseMMap != nil && !*s.options.UseMMap) {
 		s.loadRequest.UseMmap = false
 	}
@@ -749,7 +830,9 @@ func (s *ollamaServer) Load(ctx context.Context, systemInfo ml.SystemInfo, gpus 
 	var success bool
 	defer func() {
 		if !success {
-			s.initModel(ctx, LoadRequest{}, LoadOperationClose)
+			if _, err := s.initModel(ctx, LoadRequest{}, LoadOperationClose); err != nil {
+				slog.Warn("failed to close model during cleanup", "error", err)
+			}
 		}
 		if s.mem != nil {
 			s.mem.Log(slog.LevelInfo)
@@ -968,7 +1051,7 @@ func (s *llmServer) buildLayout(systemGPUs []ml.DeviceInfo, memory *ml.BackendMe
 						lastUsedGPU = i
 					}
 
-					reserved := uint64(float32(gl[i].FreeMemory)*backoff) + gl[i].MinimumMemory() + envconfig.GpuOverhead() + memory.GPUs[j].Graph
+					reserved := uint64(float64(gl[i].FreeMemory)*float64(backoff)) + gl[i].MinimumMemory() + envconfig.GpuOverhead() + memory.GPUs[j].Graph
 					if gl[i].FreeMemory > reserved {
 						gl[i].FreeMemory -= reserved
 					} else {
@@ -1139,9 +1222,12 @@ func findBestFit(layers []uint64, gpus []ml.DeviceInfo, requestedLayers int, for
 
 // greedyFit assigns layers incrementally to GPUs, spilling over as each runs out of free space
 func greedyFit(layers []uint64, gpus []ml.DeviceInfo, capacity float32, requestedLayers int) (gpuLayers ml.GPULayersList) {
+	if len(gpus) == 0 || len(layers) == 0 {
+		return nil
+	}
 	device := len(gpus) - 1
 	gpuLayers = ml.GPULayersList{{DeviceID: gpus[device].DeviceID}}
-	freeSpace := uint64(float32(gpus[device].FreeMemory) * capacity)
+	freeSpace := uint64(float64(gpus[device].FreeMemory) * float64(capacity))
 	for i := len(layers) - 1; i >= 0; i-- {
 		if requestedLayers >= 0 && len(layers)-1-i >= requestedLayers {
 			break
@@ -1149,18 +1235,27 @@ func greedyFit(layers []uint64, gpus []ml.DeviceInfo, capacity float32, requeste
 
 		for {
 			if layers[i] <= freeSpace {
-				gpuLayers[0].Layers = append([]int{i}, gpuLayers[0].Layers...)
+				// Append in reverse order (O(1) amortized); reversed below
+				gpuLayers[0].Layers = append(gpuLayers[0].Layers, i)
 				freeSpace -= layers[i]
 				break
 			}
 
 			device--
 			if device < 0 {
+				// Reverse layers in each GPU entry before returning
+				for idx := range gpuLayers {
+					slices.Reverse(gpuLayers[idx].Layers)
+				}
 				return gpuLayers
 			}
 			gpuLayers = append(ml.GPULayersList{{DeviceID: gpus[device].DeviceID}}, gpuLayers...)
-			freeSpace = uint64(float32(gpus[device].FreeMemory) * capacity)
+			freeSpace = uint64(float64(gpus[device].FreeMemory) * float64(capacity))
 		}
+	}
+	// Reverse layers in each GPU entry to restore ascending order
+	for idx := range gpuLayers {
+		slices.Reverse(gpuLayers[idx].Layers)
 	}
 	return gpuLayers
 }
@@ -1304,7 +1399,7 @@ func (s *llmServer) getServerStatus(ctx context.Context) (ServerStatus, error) {
 
 	switch ssr.Status {
 	case ServerStatusLoadingModel:
-		s.loadProgress = ssr.Progress
+		s.loadProgress.Store(math.Float32bits(ssr.Progress))
 		return ssr.Status, nil
 	case ServerStatusLaunched, ServerStatusReady, ServerStatusNoSlotsAvailable:
 		return ssr.Status, nil
@@ -1368,7 +1463,7 @@ func (s *llmServer) WaitUntilRunning(ctx context.Context) error {
 			if s.status != nil && s.status.LastErrMsg != "" {
 				msg = s.status.LastErrMsg
 			}
-			return fmt.Errorf("timed out waiting for llama runner to start - progress %0.2f - %s", s.loadProgress, msg)
+			return fmt.Errorf("timed out waiting for llama runner to start - progress %0.2f - %s", math.Float32frombits(s.loadProgress.Load()), msg)
 		}
 		if s.cmd.ProcessState != nil {
 			msg := ""
@@ -1377,10 +1472,10 @@ func (s *llmServer) WaitUntilRunning(ctx context.Context) error {
 			}
 			return fmt.Errorf("llama runner process no longer running: %d %s", s.cmd.ProcessState.ExitCode(), msg)
 		}
-		ctx, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
-		defer cancel()
-		priorProgress := s.loadProgress
-		status, _ := s.getServerStatus(ctx)
+		sCtx, sCancel := context.WithTimeout(ctx, 200*time.Millisecond)
+		priorProgress := math.Float32frombits(s.loadProgress.Load())
+		status, _ := s.getServerStatus(sCtx)
+		sCancel() // cancel immediately; don't defer in loop to avoid accumulating
 		if lastStatus != status && status != ServerStatusReady {
 			// Only log on status changes
 			slog.Info("waiting for server to become available", "status", status)
@@ -1392,10 +1487,11 @@ func (s *llmServer) WaitUntilRunning(ctx context.Context) error {
 		default:
 			lastStatus = status
 			// Reset the timer as long as we're making forward progress on the load
-			if priorProgress != s.loadProgress {
-				slog.Debug(fmt.Sprintf("model load progress %0.2f", s.loadProgress))
+			currentProgress := math.Float32frombits(s.loadProgress.Load())
+			if priorProgress != currentProgress {
+				slog.Debug(fmt.Sprintf("model load progress %0.2f", currentProgress))
 				stallTimer = time.Now().Add(stallDuration)
-			} else if !fullyLoaded && int(s.loadProgress*100.0) >= 100 {
+			} else if !fullyLoaded && int(currentProgress*100.0) >= 100 {
 				slog.Debug("model load completed, waiting for server to become available", "status", status)
 				stallTimer = time.Now().Add(stallDuration)
 				fullyLoaded = true
@@ -1759,7 +1855,7 @@ func (s *llmServer) Embedding(ctx context.Context, input string) ([]float32, int
 
 	var e EmbeddingResponse
 	if err := json.Unmarshal(body, &e); err != nil {
-		return nil, 0, fmt.Errorf("unmarshal tokenize response: %w", err)
+		return nil, 0, fmt.Errorf("unmarshal embedding response: %w", err)
 	}
 
 	return e.Embedding, e.PromptEvalCount, nil
@@ -1809,6 +1905,9 @@ func (s *llamaServer) Detokenize(ctx context.Context, tokens []int) (string, err
 func (s *ollamaServer) Detokenize(ctx context.Context, tokens []int) (string, error) {
 	toks := make([]int32, len(tokens))
 	for i, t := range tokens {
+		if t > math.MaxInt32 || t < math.MinInt32 {
+			return "", fmt.Errorf("token id %d out of int32 range", t)
+		}
 		toks[i] = int32(t)
 	}
 
@@ -1828,7 +1927,7 @@ func (s *llmServer) Close() error {
 	}
 	s.llamaModelLock.Unlock()
 
-	if s.cmd != nil {
+	if s.cmd != nil && s.cmd.Process != nil {
 		slog.Debug("stopping llama server", "pid", s.Pid())
 		if err := s.cmd.Process.Kill(); err != nil {
 			return err

@@ -4,35 +4,55 @@
   </a>
 </p>
 
-# Ollama
+# Ollama TurboQuant Fork
 
-Start building with open models.
+> **This is NOT the official Ollama.** This is an unofficial fork ([amarce/ollama](https://github.com/amarce/ollama)) that adds [Google TurboQuant](https://arxiv.org/abs/2504.19874) KV cache compression for NVIDIA CUDA GPUs. For the official project, visit [github.com/ollama/ollama](https://github.com/ollama/ollama).
+
+### What's different from official Ollama?
+
+| Feature | Official Ollama | This Fork |
+|---------|----------------|-----------|
+| TurboQuant KV cache compression | Not available | Auto-enabled on CUDA GPUs |
+| CUDA KV cache compression | Q4_0/Q8_0 via FA | PolarQuant + QJL (3-bit ~5.3x) |
+| Context scaling | Manual `num_ctx` | Automatic based on compression ratio |
+| Desktop Settings | No TurboQuant toggle | Auto/On/Off tri-state selector |
+| Flash Attention promotion | Manual only | Auto-promoted when TurboQuant active |
+| Version | Latest stable | v2.0.2-turboquant (based on upstream) |
+
+All other Ollama features (model library, REST API, integrations, etc.) work identically.
 
 ## Download
 
-### macOS
+### Windows (TurboQuant)
+
+Download from [Releases](https://github.com/amarce/ollama/releases/tag/v2.0.2-turboquant):
+
+- **[OllamaSetup-turboquant.exe](https://github.com/amarce/ollama/releases/download/v2.0.2-turboquant/OllamaSetup-turboquant.exe)** — Full installer (adds to PATH, Start Menu, URL protocol)
+- **[ollama-windows-amd64-turboquant.zip](https://github.com/amarce/ollama/releases/download/v2.0.2-turboquant/ollama-windows-amd64-turboquant.zip)** — Portable binary
+
+The installer can upgrade existing official Ollama installations in-place. Supports `/VERYSILENT` for unattended installs.
+
+### Official Ollama (without TurboQuant)
+
+For the official builds without TurboQuant, use the standard download methods:
+
+#### macOS
 
 ```shell
 curl -fsSL https://ollama.com/install.sh | sh
 ```
 
-or [download manually](https://ollama.com/download/Ollama.dmg)
-
-### Windows
+#### Windows
 
 ```shell
 irm https://ollama.com/install.ps1 | iex
 ```
 
-or [download manually](https://ollama.com/download/OllamaSetup.exe)
-
-### Linux
+#### Linux
 
 ```shell
 curl -fsSL https://ollama.com/install.sh | sh
 ```
-
-[Manual install instructions](https://docs.ollama.com/linux#manual-install)
 
 ### Docker
 
@@ -137,6 +157,86 @@ const response = await ollama.chat({
 });
 console.log(response.message.content);
 ```
+
+## TurboQuant KV Cache Compression
+
+This fork adds [Google TurboQuant](https://arxiv.org/abs/2504.19874) (ICLR 2026) for CUDA-accelerated KV cache compression, enabling significantly larger context windows and more concurrent model serving on NVIDIA GPUs.
+
+TurboQuant uses a two-stage compression pipeline:
+1. **PolarQuant**: Randomized Hadamard Transform (WHT) + polar coordinate quantization
+2. **QJL**: Johnson-Lindenstrauss sign-bit residual correction
+
+### How it works
+
+On NVIDIA CUDA GPUs, TurboQuant **auto-enables by default** — no configuration needed. The system:
+1. Detects CUDA GPUs at startup
+2. Verifies Flash Attention support (GPU compute capability + model compatibility)
+3. Promotes Flash Attention from Auto to Enabled if safe
+4. Sets the KV cache type to TurboQuant and scales context length automatically
+
+If Flash Attention is unsupported by the GPU or model, TurboQuant gracefully falls back to default behavior.
+
+### Compression Ratios
+
+| Setting | Compression | Quality | Use Case |
+|---------|------------|---------|----------|
+| 3-bit (default) | ~5.3x | 99.5% attention fidelity | Recommended for production |
+| 4-bit | ~4.0x | Excellent | Conservative, highest quality |
+| 2-bit | ~6.4x | Good | Aggressive, maximum memory savings |
+
+### Configuration
+
+TurboQuant has three modes, configurable via environment variable or the desktop app Settings:
+
+| Mode | Env Var | Desktop Setting | Behavior |
+|------|---------|-----------------|----------|
+| **Auto** (default) | *(not set)* | Auto | Enables on CUDA GPUs if FA supported |
+| **Force On** | `OLLAMA_TURBOQUANT=true` | On | Always enable (fails if no CUDA) |
+| **Force Off** | `OLLAMA_TURBOQUANT=false` | Off | Never enable |
+
+```bash
+# Auto mode (default) — just run, auto-enables on CUDA
+ollama serve
+
+# Explicit 3-bit compression
+OLLAMA_TURBOQUANT=3 ollama serve
+
+# Explicit 4-bit (more conservative)
+OLLAMA_TURBOQUANT=4 ollama serve
+
+# Disable even on CUDA
+OLLAMA_TURBOQUANT=false ollama serve
+```
+
+On Windows:
+```powershell
+# Auto mode (default, just run)
+ollama serve
+
+# Explicit enable
+$env:OLLAMA_TURBOQUANT="true"
+ollama serve
+```
+
+### Safety checks
+
+TurboQuant includes multiple safety gates to avoid broken configurations:
+- **GPU check**: Only activates on CUDA GPUs with Flash Attention support (compute capability 7.0+, excluding 7.2)
+- **Model check**: Only promotes FA if the model supports Flash Attention
+- **FA explicit disable**: Respects `OLLAMA_FLASH_ATTENTION=0` — won't override user intent
+- **Context scaling gate**: Only scales context when all FA checks pass, preventing OOM from over-allocation
+- **CPU-only mode**: FA support correctly returns true for empty GPU lists, preserving CPU behavior
+
+### CUDA kernel optimizations (v2.0.2)
+
+- QJL residuals precomputed during angle quantization and cached in shared memory
+- Eliminates ~12,000 volatile byte reads per vector (for head_dim=128, 3-bit)
+- Removes `__threadfence_block()` barrier between encode stages
+- Walsh-Hadamard Transform zero-padded to next power-of-2 for non-standard head dimensions
+
+> **Note**: Context window defaults are automatically scaled based on the effective compression ratio (Q4_0 = 4x, not theoretical maximum) to avoid overcommitting GPU memory.
+
+> **Reference**: "TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate" (Google Research, ICLR 2026, [arXiv 2504.19874](https://arxiv.org/abs/2504.19874))
 
 ## Supported backends
 

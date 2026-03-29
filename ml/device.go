@@ -346,7 +346,7 @@ func (d DeviceInfo) Driver() string {
 // on the device for overhead (e.g. VRAM consumed by context structures independent
 // of model allocations)
 func (d DeviceInfo) MinimumMemory() uint64 {
-	if d.Library == "Metal" {
+	if strings.EqualFold(d.Library, "Metal") {
 		return 512 * format.MebiByte
 	}
 	return 457 * format.MebiByte
@@ -454,6 +454,9 @@ func (a DeviceInfo) Compare(b DeviceInfo) DeviceComparison {
 // For a SameBackendDevice, return true if b is better than a
 // e.g. newer GPU library version
 func (a DeviceInfo) IsBetter(b DeviceInfo) bool {
+	if len(a.LibraryPath) == 0 || len(b.LibraryPath) == 0 {
+		return false
+	}
 	aLib := a.LibraryPath[len(a.LibraryPath)-1]
 	bLib := b.LibraryPath[len(b.LibraryPath)-1]
 	if aLib == bLib {
@@ -478,12 +481,15 @@ func (a DeviceInfo) IsBetter(b DeviceInfo) bool {
 
 // For each GPU, check if it does NOT support flash attention
 func FlashAttentionSupported(l []DeviceInfo) bool {
+	if len(l) == 0 {
+		return true // no GPUs means CPU-only; no unsupported GPU found
+	}
 	for _, gpu := range l {
-		supportsFA := gpu.Library == "cpu" ||
-			gpu.Name == "Metal" || gpu.Library == "Metal" ||
-			(gpu.Library == "CUDA" && gpu.DriverMajor >= 7 && !(gpu.ComputeMajor == 7 && gpu.ComputeMinor == 2)) ||
-			gpu.Library == "ROCm" ||
-			gpu.Library == "Vulkan"
+		supportsFA := strings.EqualFold(gpu.Library, "cpu") ||
+			strings.EqualFold(gpu.Name, "Metal") || strings.EqualFold(gpu.Library, "Metal") ||
+			(strings.EqualFold(gpu.Library, "CUDA") && gpu.DriverMajor >= 7 && !(gpu.ComputeMajor == 7 && gpu.ComputeMinor == 2)) ||
+			strings.EqualFold(gpu.Library, "ROCm") ||
+			strings.EqualFold(gpu.Library, "Vulkan")
 
 		if !supportsFA {
 			return false
@@ -538,7 +544,7 @@ func GetVisibleDevicesEnv(l []DeviceInfo, mustFilter bool) map[string]string {
 func (d DeviceInfo) NeedsInitValidation() bool {
 	// ROCm: rocblas will crash on unsupported devices.
 	// CUDA: verify CC is supported by the version of the library
-	return d.Library == "ROCm" || d.Library == "CUDA"
+	return strings.EqualFold(d.Library, "ROCm") || strings.EqualFold(d.Library, "CUDA")
 }
 
 // Set the init validation environment variable
@@ -553,7 +559,7 @@ func (d DeviceInfo) PreferredLibrary(other DeviceInfo) bool {
 	// TODO in the future if we find Vulkan is better than ROCm on some devices
 	// that implementation can live here.
 
-	if d.Library == "CUDA" || d.Library == "ROCm" {
+	if strings.EqualFold(d.Library, "CUDA") || strings.EqualFold(d.Library, "ROCm") {
 		return true
 	}
 	return false

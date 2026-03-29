@@ -851,7 +851,9 @@ func (f GGML) SupportsKVCacheType(cacheType string) bool {
 		return true
 	}
 
-	return slices.Contains([]string{"q8_0", "q4_0"}, cacheType)
+	return slices.Contains([]string{"q8_0", "q4_0",
+		"turboquant", "turboquant2", "turboquant3", "turboquant4",
+		"tq2", "tq3", "tq4"}, cacheType)
 }
 
 // KVCacheTypeIsQuantized checks if the requested cache type is a quantized type
@@ -913,6 +915,18 @@ func kvCacheBytesPerElement(cacheType string) float64 {
 		return 0.5 // 1/4 of fp16
 	case "f32":
 		return 4 // f32 (default for recurrent)
+	case "turboquant", "turboquant3", "tq3":
+		// TurboQuant 3-bit: runtime currently uses Q4_0 as underlying storage
+		// while TurboQuant CUDA kernels handle encode/decode transparently.
+		// Use Q4_0 size (0.5 bytes/elem) for memory planning to match actual
+		// allocation and avoid VRAM overcommit.
+		return 0.5
+	case "turboquant4", "tq4":
+		// TurboQuant 4-bit: uses Q4_0 underlying storage
+		return 0.5
+	case "turboquant2", "tq2":
+		// TurboQuant 2-bit: uses Q4_0 underlying storage
+		return 0.5
 	default:
 		return 2 // f16 (default)
 	}
