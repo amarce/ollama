@@ -267,8 +267,9 @@ func NewLlamaServer(systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, modelPath st
 	tqValue := envconfig.TurboQuant()
 	tqConfig := turboquant.ParseConfig(tqValue)
 
-	// Auto-enable if OLLAMA_TURBOQUANT is not set and CUDA GPUs are present
-	if tqValue == "" {
+	// Auto-enable if OLLAMA_TURBOQUANT is not set, CUDA GPUs are present,
+	// and no explicit KV cache type was requested by the user.
+	if tqValue == "" && kvct == "" {
 		for _, gpu := range gpus {
 			if strings.EqualFold(gpu.Library, "cuda") {
 				tqConfig = turboquant.Config{Enabled: true, NumBits: turboquant.DefaultBits}

@@ -1851,12 +1851,15 @@ func Serve(ln net.Listener) error {
 
 	// TurboQuant KV cache compression: auto-enable on CUDA GPUs when not
 	// explicitly configured, or honour the user's explicit setting.
+	// Context scaling is only applied when flash attention is available,
+	// since quantized KV cache types require it.
 	tqValue := envconfig.TurboQuant()
+	kvCacheExplicit := envconfig.KvCacheType() != ""
 	tqConfig := turboquant.ParseConfig(tqValue)
 
-	// Auto-enable: if the user hasn't set OLLAMA_TURBOQUANT at all, enable
-	// it automatically when CUDA GPUs are present.
-	if tqValue == "" {
+	// Auto-enable: if the user hasn't set OLLAMA_TURBOQUANT at all and hasn't
+	// set an explicit KV cache type, enable automatically on CUDA.
+	if tqValue == "" && !kvCacheExplicit {
 		for _, gpu := range gpus {
 			if strings.EqualFold(gpu.Library, "cuda") {
 				tqConfig = turboquant.Config{Enabled: true, NumBits: turboquant.DefaultBits}
@@ -1866,37 +1869,41 @@ func Serve(ln net.Listener) error {
 		}
 	}
 
+	// Only scale context if flash attention is not explicitly disabled,
+	// since TurboQuant maps to Q4_0 which requires FA at model-load time.
+	faExplicitlyOff := envconfig.FlashAttention(true) != envconfig.FlashAttention(false) && !envconfig.FlashAttention(false)
+
 	if tqConfig.Enabled {
-		hasCUDA := false
-		for _, gpu := range gpus {
-			if strings.EqualFold(gpu.Library, "cuda") {
-				hasCUDA = true
-				break
-			}
-		}
-		if !hasCUDA {
-			slog.Warn("turboquant enabled but no CUDA GPU detected, skipping context scaling")
-		} else if err := tqConfig.Validate(); err != nil {
-			slog.Warn("invalid turboquant config, ignoring", "error", err)
+		if faExplicitlyOff {
+			slog.Warn("turboquant enabled but flash attention is disabled; skipping context scaling")
 		} else {
-			tqConfig.LogConfig()
-			ratio := tqConfig.EffectiveCompressionRatio()
-			// KV cache typically uses ~60-70% of model VRAM, so the effective
-			// context multiplier is less than the raw compression ratio.
-			// Use a conservative estimate: ratio * 0.6 as the context multiplier
-			// to avoid overcommitting. For 5.3x compression this gives ~3.2x context.
-			contextMultiplier := ratio * 0.6 // 60% of VRAM goes to KV cache
-			if contextMultiplier < 1.0 {
-				contextMultiplier = 1.0
+			hasCUDA := false
+			for _, gpu := range gpus {
+				if strings.EqualFold(gpu.Library, "cuda") {
+					hasCUDA = true
+					break
+				}
 			}
-			newCtx := int(float64(s.defaultNumCtx) * contextMultiplier)
-			slog.Info("turboquant context scaling",
-				"original_ctx", s.defaultNumCtx,
-				"compression_ratio", fmt.Sprintf("%.1fx", ratio),
-				"context_multiplier", fmt.Sprintf("%.1fx", contextMultiplier),
-				"new_ctx", newCtx,
-			)
-			s.defaultNumCtx = newCtx
+			if !hasCUDA {
+				slog.Warn("turboquant enabled but no CUDA GPU detected, skipping context scaling")
+			} else if err := tqConfig.Validate(); err != nil {
+				slog.Warn("invalid turboquant config, ignoring", "error", err)
+			} else {
+				tqConfig.LogConfig()
+				ratio := tqConfig.EffectiveCompressionRatio()
+				contextMultiplier := ratio * 0.6
+				if contextMultiplier < 1.0 {
+					contextMultiplier = 1.0
+				}
+				newCtx := int(float64(s.defaultNumCtx) * contextMultiplier)
+				slog.Info("turboquant context scaling",
+					"original_ctx", s.defaultNumCtx,
+					"compression_ratio", fmt.Sprintf("%.1fx", ratio),
+					"context_multiplier", fmt.Sprintf("%.1fx", contextMultiplier),
+					"new_ctx", newCtx,
+				)
+				s.defaultNumCtx = newCtx
+			}
 		}
 	}
 

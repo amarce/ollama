@@ -242,6 +242,9 @@ func (s *Server) cmd(ctx context.Context) (*exec.Cmd, error) {
 	}
 	if settings.TurboQuantEnabled {
 		env["OLLAMA_TURBOQUANT"] = "true"
+	} else {
+		// Explicitly disable so auto-enable logic doesn't activate on CUDA
+		env["OLLAMA_TURBOQUANT"] = "false"
 	}
 	if cloudDisabled {
 		env["OLLAMA_NO_CLOUD"] = "1"
