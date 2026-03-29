@@ -1,0 +1,148 @@
+---
+title: Building Windows Binaries and Installer on Linux
+---
+
+> This guide is specific to the [TurboQuant fork](https://github.com/amarce/ollama).
+
+## Prerequisites
+
+Install the following packages on a Debian/Ubuntu system:
+
+```bash
+apt-get install -y \
+  golang-go \
+  gcc-mingw-w64-x86-64 \
+  g++-mingw-w64-x86-64 \
+  nodejs \
+  npm \
+  docker.io \
+  p7zip-full
+```
+
+Verify the toolchain:
+
+```bash
+go version                         # Go 1.23+
+x86_64-w64-mingw32-gcc --version   # mingw cross-compiler
+node --version                     # Node.js 18+
+docker --version                   # Docker 20+
+```
+
+## Fix Case-Sensitive Header
+
+Linux is case-sensitive but Windows is not. The WebView2 header references `EventToken.h` while mingw ships `eventtoken.h`. Create a symlink:
+
+```bash
+sudo ln -sf /usr/x86_64-w64-mingw32/include/eventtoken.h \
+            /usr/x86_64-w64-mingw32/include/EventToken.h
+```
+
+## Step 1: Build the React UI
+
+```bash
+cd app/ui/app
+npm install
+npm run build
+cd ../../..
+```
+
+## Step 2: Generate Go Bindings
+
+```bash
+go generate ./...
+```
+
+## Step 3: Build ollama.exe (CLI)
+
+This produces the main CLI binary with an embedded Windows icon:
+
+```bash
+# Compile the Windows resource file (icon + version info)
+x86_64-w64-mingw32-windres -o ollama_windows_amd64.syso ollama.rc
+
+# Cross-compile the CLI
+CC=x86_64-w64-mingw32-gcc \
+CXX=x86_64-w64-mingw32-g++ \
+GOOS=windows GOARCH=amd64 CGO_ENABLED=1 \
+go build -trimpath \
+  -ldflags "-s -w -X=github.com/ollama/ollama/version.Version=2.0.2-turboquant" \
+  -o dist/windows-amd64/ollama.exe .
+```
+
+## Step 4: Build the Tray App
+
+The tray app provides the system tray icon, settings UI, and auto-start functionality:
+
+```bash
+CC=x86_64-w64-mingw32-gcc \
+CXX=x86_64-w64-mingw32-g++ \
+GOOS=windows GOARCH=amd64 CGO_ENABLED=1 \
+go build -trimpath \
+  -ldflags "-s -w -H windowsgui \
+    -X=github.com/ollama/ollama/version.Version=2.0.2-turboquant \
+    -X=github.com/ollama/ollama/app/version.Version=2.0.2-turboquant" \
+  -o dist/windows-ollama-app-amd64.exe ./app/cmd/app/
+```
+
+## Step 5: Download VC++ Redistributable
+
+```bash
+curl -L -o dist/windows-amd64/vc_redist.x64.exe \
+  "https://aka.ms/vs/17/release/vc_redist.x64.exe"
+```
+
+## Step 6: Build the Inno Setup Installer
+
+The installer is built using the [amake/innosetup](https://hub.docker.com/r/amake/innosetup) Docker image, which bundles the Inno Setup compiler under Wine:
+
+```bash
+# Start Docker if needed
+# sudo dockerd &
+
+# Fix dist directory permissions for Wine
+chmod -R 777 dist/
+
+# Build the installer
+docker run --rm \
+  -v "$(pwd):/work" \
+  -e PKG_VERSION=2.0.2 \
+  amake/innosetup app/ollama-turboquant.iss
+```
+
+The output is `dist/OllamaSetup-turboquant.exe` — a proper Inno Setup installer that:
+- Installs the tray app (`ollama app.exe`) and CLI (`ollama.exe`)
+- Installs VC++ Redistributables if needed
+- Adds the install directory to the user PATH
+- Registers the `ollama://` URL protocol
+- Creates Start Menu shortcuts with the Ollama icon
+- Supports silent install: `OllamaSetup-turboquant.exe /VERYSILENT`
+
+## Step 7: Create Release Assets
+
+```bash
+# Create the standalone zip
+cd dist/windows-amd64
+zip -j ../ollama-windows-amd64-turboquant.zip ollama.exe
+cd ../..
+
+# Generate checksums
+cd dist
+sha256sum windows-amd64/ollama.exe \
+         OllamaSetup-turboquant.exe \
+         ollama-windows-amd64-turboquant.zip > SHA256SUMS
+```
+
+## Output Files
+
+| File | Description |
+|------|-------------|
+| `dist/OllamaSetup-turboquant.exe` | Full Inno Setup installer (tray + CLI + VC++ redist) |
+| `dist/windows-amd64/ollama.exe` | Standalone CLI binary |
+| `dist/windows-ollama-app-amd64.exe` | Tray app (GUI, used by installer) |
+| `dist/ollama-windows-amd64-turboquant.zip` | Standalone CLI zip |
+
+## Notes
+
+- **No CUDA/ROCm backends**: Cross-compilation cannot build the native GPU backends (CUDA, ROCm, Vulkan). These require the NVIDIA CUDA Toolkit and Visual Studio on Windows. The CLI will still work using CPU inference, and TurboQuant's Go-level compression logic is fully functional.
+- **Inno Setup version**: The Docker image uses IS 6.7.x. The fork ISS file is at `app/ollama-turboquant.iss`.
+- **Icon embedding**: The `.syso` resource file is automatically linked by the Go compiler when `GOOS=windows`. The `ollama.rc` file references `app/assets/app.ico`.
