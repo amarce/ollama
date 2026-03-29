@@ -14,7 +14,7 @@ import (
 
 // currentSchemaVersion defines the current database schema version.
 // Increment this when making schema changes that require migrations.
-const currentSchemaVersion = 16
+const currentSchemaVersion = 17
 
 // database wraps the SQLite connection.
 // SQLite handles its own locking for concurrent access:
@@ -87,7 +87,7 @@ func (db *database) init() error {
 		cloud_setting_migrated BOOLEAN NOT NULL DEFAULT 0,
 		remote TEXT NOT NULL DEFAULT '', -- deprecated
 		auto_update_enabled BOOLEAN NOT NULL DEFAULT 1,
-		turboquant_enabled BOOLEAN NOT NULL DEFAULT 0,
+		turboquant_enabled INTEGER NOT NULL DEFAULT 0,
 		schema_version INTEGER NOT NULL DEFAULT %d
 	);
 
@@ -271,6 +271,12 @@ func (db *database) migrate() error {
 				return fmt.Errorf("migrate v15 to v16: %w", err)
 			}
 			version = 16
+		case 16:
+			// fix turboquant_enabled column: convert boolean strings to integers
+			if err := db.migrateV16ToV17(); err != nil {
+				return fmt.Errorf("migrate v16 to v17: %w", err)
+			}
+			version = 17
 		default:
 			// If we have a version we don't recognize, just set it to current
 			// This might happen during development
@@ -533,6 +539,28 @@ func (db *database) migrateV15ToV16() error {
 	}
 
 	_, err = db.conn.Exec(`UPDATE settings SET schema_version = 16`)
+	if err != nil {
+		return fmt.Errorf("update schema version: %w", err)
+	}
+
+	return nil
+}
+
+// migrateV16ToV17 fixes the turboquant_enabled column type.
+// SQLite stored BOOLEAN DEFAULT 0 as the string "false" in some drivers,
+// which cannot be scanned back into a Go int. This converts any boolean
+// string values to their integer equivalents.
+func (db *database) migrateV16ToV17() error {
+	_, err := db.conn.Exec(`UPDATE settings SET turboquant_enabled = CASE
+		WHEN turboquant_enabled = 'false' OR turboquant_enabled = 'FALSE' THEN 0
+		WHEN turboquant_enabled = 'true' OR turboquant_enabled = 'TRUE' THEN 1
+		ELSE turboquant_enabled
+	END`)
+	if err != nil {
+		return fmt.Errorf("fix turboquant_enabled values: %w", err)
+	}
+
+	_, err = db.conn.Exec(`UPDATE settings SET schema_version = 17`)
 	if err != nil {
 		return fmt.Errorf("update schema version: %w", err)
 	}
