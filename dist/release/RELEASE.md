@@ -1,23 +1,31 @@
-# Ollama v2.0.2-turboquant Release
+# Ollama v2.1.0-turboquant Release
 
-> **This is NOT the official Ollama.** This is the [TurboQuant fork](https://github.com/amarce/ollama) which adds automatic KV cache compression on NVIDIA GPUs.
+> **This is NOT the official Ollama.** This is the [TurboQuant fork](https://github.com/amarce/ollama) which adds automatic KV cache compression on NVIDIA GPUs and image generation support on Windows.
 
-## What's New in v2.0.2
+## What's New in v2.1.0
+
+- **Image generation on Windows**: MLX CUDA 12 backend enables image generation models (FLUX, z-image-turbo, etc.) on NVIDIA GPUs
+- **CUDA dequantization crash fix**: Fixed lazy tensor evaluation bug where `Shape()` returned empty slices after dequantization on CUDA backends, causing index-out-of-bounds crashes with quantized image generation models
+- **Full backend bundle**: Installer now includes CPU, CUDA 12, CUDA 13, ROCm, Vulkan, and MLX CUDA 12/13 backends — everything in one package
+
+### Carried from v2.0.x
 
 - **TurboQuant KV cache compression**: Auto-enables on NVIDIA CUDA GPUs with Flash Attention support, compressing the KV cache by up to ~5.3x (3-bit default)
 - **Tri-state TurboQuant control**: Auto (default) / On / Off — configurable via desktop app Settings dropdown or `OLLAMA_TURBOQUANT` environment variable
 - **CUDA kernel optimizations**: Shared-memory residual caching eliminates ~12K volatile reads per vector in the QJL stage
-- **Flash Attention safety gates**: FA promotion now properly checks both GPU capability and model support before enabling
-- **CPU-only FA fix**: Restored correct semantics for CPU-only mode (no GPU = no unsupported GPU)
-- **Streaming robustness**: Error JSON responses on marshal failures, progress timeout detection
-- **Retry backoff**: Exponential backoff for expired runner retries (10ms–640ms cap)
 
 ## Windows amd64 Build
 
-- **ollama.exe**: Cross-compiled with mingw for Windows x86-64
-- **OllamaSetup-turboquant.exe**: Full Go-based installer that replicates official Inno Setup behavior
-- **Build flags**: `-trimpath -ldflags "-s -w"` with version 2.0.2-turboquant
-- **CGO**: Enabled with x86_64-w64-mingw32-gcc cross-compiler
+- **ollama.exe**: CLI binary for Windows x86-64
+- **OllamaSetup-turboquant.exe**: Full Inno Setup installer with all backends
+- **Backends included**:
+  - CPU (ggml-cpu)
+  - CUDA 12 (ggml-cuda + TurboQuant)
+  - CUDA 13 (ggml-cuda)
+  - MLX CUDA 12 (image generation)
+  - MLX CUDA 13 (image generation)
+  - ROCm 6 (AMD)
+  - Vulkan
 
 ## Installation
 
@@ -40,8 +48,19 @@ OllamaSetup-turboquant.exe /VERYSILENT
 ### Manual Install
 
 1. Download `ollama-windows-amd64-turboquant.zip`
-2. Extract `ollama.exe` to `%LOCALAPPDATA%\Programs\Ollama`
-3. Add that directory to your PATH
+2. Extract to `%LOCALAPPDATA%\Programs\Ollama`
+3. For image generation, also extract `ollama-windows-amd64-mlx.zip` to the same location
+4. Add the directory to your PATH
+
+## Image Generation
+
+Supported models include FLUX and z-image-turbo variants. Example:
+
+```
+ollama run x/z-image-turbo:latest "generate an image of a mountain landscape"
+```
+
+**Requirements**: NVIDIA GPU with CUDA 12+ and cuDNN 9.18+ installed.
 
 ## TurboQuant Configuration
 

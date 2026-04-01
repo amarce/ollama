@@ -1,3 +1,3 @@
 package version
 
-var Version string = "2.0.3-turboquant"
+var Version string = "2.1.0-turboquant"

@@ -256,9 +256,11 @@ function vulkan {
     }
 }
 
-function mlxCuda13 {
+function mlxCudaCommon {
+    param (
+        [string]$cudaMajorVer
+    )
     mkdir -Force -path "${script:DIST_DIR}\" | Out-Null
-    $cudaMajorVer="13"
     if ($script:ARCH -ne "arm64") {
         if ("$script:CUDA_DIRS".Contains("v$cudaMajorVer")) {
             foreach ($d in $Script:CUDA_DIRS){
@@ -312,6 +314,14 @@ function mlxCuda13 {
             Write-Output "CUDA v$cudaMajorVer not detected, skipping MLX build"
         }
     }
+}
+
+function mlxCuda12 {
+    mlxCudaCommon("12")
+}
+
+function mlxCuda13 {
+    mlxCudaCommon("13")
 }
 
 function ollama {
@@ -414,13 +424,15 @@ function installer {
         Write-Output "ERROR: missing Inno Setup installation directory - install from https://jrsoftware.org/isdl.php"
         exit 1
     }
-    Write-Output "Building Ollama Installer"
     cd "${script:SRC_DIR}\app"
     $env:PKG_VERSION=$script:PKG_VERSION
+
+    # Build TurboQuant installer
+    Write-Output "Building Ollama TurboQuant Installer"
     if ("${env:KEY_CONTAINER}") {
-        & "${script:INNO_SETUP_DIR}\ISCC.exe" /DARCH=$script:TARGET_ARCH /SMySignTool="${script:SignTool} sign /fd sha256 /t http://timestamp.digicert.com /f ${script:OLLAMA_CERT} /csp `$qGoogle Cloud KMS Provider`$q /kc ${env:KEY_CONTAINER} `$f" .\ollama.iss
+        & "${script:INNO_SETUP_DIR}\ISCC.exe" /DARCH=$script:TARGET_ARCH /SMySignTool="${script:SignTool} sign /fd sha256 /t http://timestamp.digicert.com /f ${script:OLLAMA_CERT} /csp `$qGoogle Cloud KMS Provider`$q /kc ${env:KEY_CONTAINER} `$f" .\ollama-turboquant.iss
     } else {
-        & "${script:INNO_SETUP_DIR}\ISCC.exe" /DARCH=$script:TARGET_ARCH .\ollama.iss
+        & "${script:INNO_SETUP_DIR}\ISCC.exe" /DARCH=$script:TARGET_ARCH .\ollama-turboquant.iss
     }
     if ($LASTEXITCODE -ne 0) { exit($LASTEXITCODE)}
 }
@@ -528,6 +540,7 @@ try {
         cuda13
         rocm6
         vulkan
+        mlxCuda12
         mlxCuda13
         ollama
         app

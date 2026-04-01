@@ -105,6 +105,7 @@
       "name": "MLX CUDA 12",
       "inherits": [ "MLX", "CUDA 12" ],
       "cacheVariables": {
+        "MLX_CUDA_ARCHITECTURES": "50;52;60;61;70;75;80;86;89;90;90a;120",
         "OLLAMA_RUNNER_DIR": "mlx_cuda_v12"
       }
     },

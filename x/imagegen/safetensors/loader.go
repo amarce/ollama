@@ -316,6 +316,9 @@ func LoadMultiLinearLayer(weights WeightSource, path string) (nn.MultiLinearLaye
 			groupSize = weightCols * packFactor / scalesCols
 		}
 		weight = mlx.Dequantize(weight, scales, qbiases, groupSize, bits, "affine")
+		// Force evaluation so Shape() returns valid metadata on CUDA backends
+		// where lazy tensors may not have shape info populated yet.
+		mlx.Eval(weight)
 	}
 
 	return nn.NewMultiLinear(weight), nil
@@ -409,6 +412,9 @@ func LoadLinearLayer(weights WeightSource, path string) (nn.LinearLayer, error) 
 		}
 
 		dequantized := mlx.Dequantize(weight, scales, qbiases, groupSize, bits, mode)
+		// Force evaluation so Shape() returns valid metadata on CUDA backends
+		// where lazy tensors may not have shape info populated yet.
+		mlx.Eval(dequantized)
 		return nn.NewLinear(dequantized, bias), nil
 	}
 

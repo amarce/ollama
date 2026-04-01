@@ -3,7 +3,7 @@
 ; Build with: docker run --rm -v .:/work -e PKG_VERSION=2.0.3 amake/innosetup app/ollama-turboquant.iss
 
 #define MyAppName "Ollama"
-#define MyAppVersion "2.0.3-turboquant"
+#define MyAppVersion "2.1.0-turboquant"
 #define MyAppPublisher "Ollama TurboQuant Fork"
 #define MyAppURL "https://github.com/amarce/ollama"
 #define MyAppExeName "ollama app.exe"
@@ -13,7 +13,7 @@
 AppId={{44E83376-CE68-45EB-8FC1-393500EB558C}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
-VersionInfoVersion=2.0.3.0
+VersionInfoVersion=2.1.0.0
 AppPublisher={#MyAppPublisher}
 AppPublisherURL={#MyAppURL}
 AppSupportURL={#MyAppURL}
@@ -93,7 +93,7 @@ Type: filesandordirs; Name: "{userstartup}\{#MyAppName}.lnk"
 
 [Messages]
 WizardReady=Ollama TurboQuant
-ReadyLabel1=%nLet's get you up and running with your own large language models.%n%nTurboQuant KV cache compression auto-enables on NVIDIA CUDA GPUs.
+ReadyLabel1=%nLet's get you up and running with your own large language models.%n%nTurboQuant KV cache compression auto-enables on NVIDIA CUDA GPUs.%nImage generation (MLX CUDA) included.
 SetupAppRunningError=Another Ollama installer is running.%n%nPlease cancel or finish the other installer, then click OK to continue with this install, or Cancel to exit.
 
 [Registry]
