@@ -275,8 +275,23 @@ func LoadMultiLinearLayer(weights WeightSource, path string) (nn.MultiLinearLaye
 
 		// Always dequantize for MultiLinear - no batched quantized matmul support
 		// Detect bits from tensor shapes (supports mixed-precision Q4/Q8)
+		// Eval weight+scales so Shape() returns valid metadata on CUDA backends
+		mlx.Eval(weight, scales)
 		weightShape := weight.Shape()
 		scalesShape := scales.Shape()
+
+		if len(weightShape) == 0 || len(scalesShape) == 0 {
+			// Shape unavailable — fall back to global quantization params
+			groupSize, bits, _ := QuantizationParams(weights.Quantization())
+			if bits == 0 {
+				bits = 4
+				groupSize = 32
+			}
+			weight = mlx.Dequantize(weight, scales, qbiases, groupSize, bits, "affine")
+			mlx.Eval(weight)
+			return nn.NewMultiLinear(weight), nil
+		}
+
 		weightCols := int(weightShape[len(weightShape)-1])
 		scalesCols := int(scalesShape[len(scalesShape)-1])
 
@@ -355,8 +370,30 @@ func LoadLinearLayer(weights WeightSource, path string) (nn.LinearLayer, error) 
 		}
 
 		// Detect bits from tensor shapes (supports mixed-precision Q4/Q8)
+		// Eval weight+scales so Shape() returns valid metadata on CUDA backends
+		mlx.Eval(weight, scales)
 		weightShape := weight.Shape()
 		scalesShape := scales.Shape()
+
+		if len(weightShape) == 0 || len(scalesShape) == 0 {
+			// Shape unavailable — fall back to global quantization params
+			groupSize, bits, mode := QuantizationParams(weights.Quantization())
+			if bits == 0 {
+				bits = 4
+				groupSize = 32
+				mode = "affine"
+			}
+			if mlx.MetalIsAvailable() && mode != "nvfp4" && mode != "mxfp8" {
+				return &nn.QuantizedLinear{
+					Weight: weight, Scales: scales, QBiases: qbiases, Bias: bias,
+					GroupSize: groupSize, Bits: bits, Mode: mode,
+				}, nil
+			}
+			dequantized := mlx.Dequantize(weight, scales, qbiases, groupSize, bits, mode)
+			mlx.Eval(dequantized)
+			return nn.NewLinear(dequantized, bias), nil
+		}
+
 		weightCols := int(weightShape[len(weightShape)-1])
 		scalesCols := int(scalesShape[len(scalesShape)-1])
 

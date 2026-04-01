@@ -116,6 +116,29 @@ func (s *Server) Load(ctx context.Context, _ ml.SystemInfo, gpus []ml.DeviceInfo
 	cmd := exec.Command(exe, "runner", "--imagegen-engine", "--model", s.modelName, "--port", strconv.Itoa(port))
 	cmd.Env = os.Environ()
 
+	// On Windows, prepend MLX library directories to PATH so dlfcn-win32's
+	// dlopen can resolve cuDNN and other dynamically loaded libraries.
+	if runtime.GOOS == "windows" {
+		libraryPaths := []string{ml.LibOllamaPath}
+		if mlxDirs, err := filepath.Glob(filepath.Join(ml.LibOllamaPath, "mlx_*")); err == nil {
+			libraryPaths = append(libraryPaths, mlxDirs...)
+		}
+		existingPath, _ := os.LookupEnv("PATH")
+		newPath := strings.Join(libraryPaths, string(filepath.ListSeparator)) + string(filepath.ListSeparator) + existingPath
+		found := false
+		for i := range cmd.Env {
+			if strings.HasPrefix(strings.ToUpper(cmd.Env[i]), "PATH=") {
+				cmd.Env[i] = "PATH=" + newPath
+				found = true
+				break
+			}
+		}
+		if !found {
+			cmd.Env = append(cmd.Env, "PATH="+newPath)
+		}
+		slog.Debug("mlx subprocess PATH prepended", "dirs", libraryPaths)
+	}
+
 	// On Linux, set LD_LIBRARY_PATH to include MLX library directories
 	if runtime.GOOS == "linux" {
 		// Build library paths: start with LibOllamaPath, then add any mlx_* subdirectories

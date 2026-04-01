@@ -1232,6 +1232,12 @@ func (a *Array) Dim(axis int) int32 {
 // Shape returns the shape as a slice
 func (a *Array) Shape() []int32 {
 	ndim := a.Ndim()
+	if ndim == 0 {
+		// On CUDA backends, lazy tensors may not have shape metadata populated.
+		// Force evaluation to materialize shape info.
+		Eval(a)
+		ndim = a.Ndim()
+	}
 	shape := make([]int32, ndim)
 	for i := 0; i < ndim; i++ {
 		shape[i] = a.Dim(i)
@@ -1286,16 +1292,24 @@ func (a *Array) Data() []float32 {
 	arr := a
 	if a.Dtype() != DtypeFloat32 {
 		arr = AsType(a, DtypeFloat32)
-		arr.Eval()
-		// Cast array will be cleaned up on next Eval
 	}
 
-	ptr := C.mlx_array_data_float32(arr.c)
+	// Copy to CPU stream so mlx_array_data_float32 returns a host pointer.
+	// On CUDA, arrays live in device memory and the data pointer is not
+	// directly accessible from the host without an explicit copy.
+	cpuArr := C.mlx_array_new()
+	C.mlx_copy(&cpuArr, arr.c, C.cpu_stream())
+	C.mlx_array_eval(cpuArr)
+	C.mlx_synchronize(C.cpu_stream())
+
+	ptr := C.mlx_array_data_float32(cpuArr)
 	if ptr == nil {
+		C.mlx_array_free(cpuArr)
 		return nil
 	}
 	data := make([]float32, size)
 	copy(data, unsafe.Slice((*float32)(unsafe.Pointer(ptr)), size))
+	C.mlx_array_free(cpuArr)
 	return data
 }
 
@@ -1318,12 +1332,20 @@ func (a *Array) DataInt32() []int32 {
 	if size == 0 {
 		return nil
 	}
-	ptr := C.mlx_array_data_int32(a.c)
+	// Copy to CPU for safe host access on CUDA
+	cpuArr := C.mlx_array_new()
+	C.mlx_copy(&cpuArr, a.c, C.cpu_stream())
+	C.mlx_array_eval(cpuArr)
+	C.mlx_synchronize(C.cpu_stream())
+
+	ptr := C.mlx_array_data_int32(cpuArr)
 	if ptr == nil {
+		C.mlx_array_free(cpuArr)
 		return nil
 	}
 	data := make([]int32, size)
 	copy(data, unsafe.Slice((*int32)(unsafe.Pointer(ptr)), size))
+	C.mlx_array_free(cpuArr)
 	return data
 }
 
@@ -1505,19 +1527,22 @@ type SafetensorsFile struct {
 }
 
 // LoadSafetensorsNative loads a safetensors file using MLX's optimized loader.
-// On CUDA, Load::eval_gpu is implemented so we use the default (GPU) stream.
-// On Metal, Load::eval_gpu is not implemented so we must use the CPU stream.
+// Tries GPU stream first (fast path), falls back to CPU stream on failure.
 func LoadSafetensorsNative(path string) (*SafetensorsFile, error) {
 	cPath := C.CString(path)
 	defer C.free(unsafe.Pointer(cPath))
 
-	stream := C.default_stream()
-	if runtime.GOOS == "darwin" {
-		stream = C.cpu_stream()
-	}
-
 	var arrays C.mlx_map_string_to_array
 	var metadata C.mlx_map_string_to_string
+
+	// Try GPU stream first (faster, works on most platforms)
+	stream := C.default_stream()
+	if C.mlx_load_safetensors(&arrays, &metadata, cPath, stream) == 0 {
+		return &SafetensorsFile{arrays: arrays, metadata: metadata}, nil
+	}
+
+	// Fall back to CPU stream (needed on macOS Metal, some CUDA configs)
+	stream = C.cpu_stream()
 	if C.mlx_load_safetensors(&arrays, &metadata, cPath, stream) != 0 {
 		return nil, fmt.Errorf("failed to load safetensors: %s", path)
 	}
