@@ -55,7 +55,7 @@ func NewServer(modelName string) (*Server, error) {
 	return &Server{
 		modelName: modelName,
 		done:      make(chan error, 1),
-		client:    &http.Client{Timeout: 10 * time.Minute},
+		client:    &http.Client{Timeout: 60 * time.Minute},
 	}, nil
 }
 
