@@ -73,7 +73,7 @@ func ParserForName(name string) Parser {
 		return &Olmo3ThinkParser{}
 	case "nemotron-3-nano":
 		return &Nemotron3NanoParser{}
-	case "functiongemma":
+	case "functiongemma", "gemma4":
 		return &FunctionGemmaParser{}
 	case "glm-4.7":
 		return &GLM47Parser{}
